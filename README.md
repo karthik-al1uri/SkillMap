@@ -47,7 +47,7 @@ data/raw/
 | Phase | Stage | Notebook | Status |
 |---|---|---|---|
 | 1 | Data acquisition and ingestion | `notebooks/01_data_ingestion.ipynb` | ✅ Done |
-| 2 | Preprocessing and cleaning | `notebooks/02_preprocessing.ipynb`, `src/preprocessing.py` | ⏳ Planned |
+| 2 | Preprocessing and cleaning | `notebooks/02_preprocessing.ipynb`, `src/preprocessing.py` | ✅ Done |
 | 3 | Data warehousing (SQLite star schema) and EDA | `notebooks/03_data_warehouse.ipynb` | ⏳ Planned |
 | 4 | Association rule mining and classification | `notebooks/04_association_mining.ipynb`, `notebooks/05_classification.ipynb` | ⏳ Planned |
 | 5 | Clustering and outlier detection | `notebooks/06_clustering.ipynb` | ⏳ Planned |
@@ -55,7 +55,7 @@ data/raw/
 
 **Phase 1 — Ingestion.** Load every raw table and record its shape, dtypes, null rates, duplicates, and key columns in `outputs/01_summary.txt`.
 
-**Phase 2 — Preprocessing.** Join the multi-file datasets, deduplicate, normalize titles, extract skills (spaCy + keyword list), impute missing salaries, and bin salary into Low / Mid / High tiers.
+**Phase 2 — Preprocessing.** Join the postings tables (salaries, skills, industries), normalize titles, annualize salaries by `pay_period`, drop rows with no salary or implausible salary, impute by experience-level median, and bin salary into Low / Mid / High tiers at the 33rd and 66th percentiles. Outputs `data/processed/cleaned_jobs.csv` (35,604 jobs) and `data/processed/linkedin_jobs_skills.csv` (1.29M per-job skill lists). Run with `python -m src.preprocessing`.
 
 **Phase 3 — Warehousing.** Build a star schema (`job_postings` fact table; skill, location, company, and time dimensions) in SQLite and run OLAP queries.
 

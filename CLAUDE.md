@@ -94,7 +94,7 @@ Install all with:
 pip install -r requirements.txt
 ```
 
-Local environment: Homebrew Python blocks `pip install` (PEP 668), so the project uses `.venv/` (gitignored), created with `--system-site-packages`. It reuses the system pandas/numpy/matplotlib/networkx/sklearn and adds mlxtend and ipython. Run pipelines with `.venv/bin/python -m src.<module>`.
+Local environment: Homebrew Python blocks `pip install` (PEP 668), so the project uses `.venv/` (gitignored), created with `--system-site-packages`. It reuses the system pandas/numpy/matplotlib/networkx/sklearn and adds mlxtend, ipython, and xgboost. xgboost needs `brew install libomp`. Run pipelines with `.venv/bin/python -m src.<module>`.
 
 ---
 
@@ -111,17 +111,18 @@ Local environment: Homebrew Python blocks `pip install` (PEP 668), so the projec
 - Main table: `linkedin_postings/postings.csv`, joined with `jobs/salaries.csv`, `jobs/job_skills.csv` + `mappings/skills.csv`, and `jobs/job_industries.csv` + `mappings/industries.csv`
 - Normalize job titles to lowercase and strip whitespace
 - Salary: `normalized_salary` is primary (pay_period annualized: hourly x2080, weekly x52, biweekly x26, monthly x12). Drop rows with no salary, non-USD rows, and salaries outside $10k-$1M. Impute remaining gaps by `experience_level` median
-- Discretize salary into three tiers at the 33rd/66th percentiles: Low (<= $62,400), Mid (<= $109,352), High
+- Drop reposted duplicate ads (same company_name, title, description, normalized_salary; 1,425 rows). Without this, copies land on both sides of Stage 5's split and inflate scores
+- Discretize salary into three tiers at the 33rd/66th percentiles: Low (<= $62,400), Mid (<= $109,200), High
 - `skills_list` = 35 coarse job-function categories. `matched_skills` = concrete skills: the top 100 skills from `linkedin_jobs/job_skills.csv` (spelling variants and `SKILL_SYNONYMS` merged, `EXCLUDED_TERMS` removed), regex-matched in each posting's description. Phrases containing another skill ("project management" ⊃ "management") are matched first and blanked out of the text, so there are no tautological rules. **Stages 4-6 should use `matched_skills`**
 - Outputs:
-  - `data/processed/cleaned_jobs.csv` (35,604 rows): job_id, job_title, company_name, location, experience_level, industry, skills_list, matched_skills, normalized_salary, salary_tier. Read it with `src.preprocessing.load_cleaned_jobs()` so the list columns are parsed
+  - `data/processed/cleaned_jobs.csv` (34,179 rows): job_id, job_title, company_name, location, experience_level, industry, skills_list, matched_skills, normalized_salary, salary_tier. Read it with `src.preprocessing.load_cleaned_jobs()` so the list columns are parsed
   - `data/processed/linkedin_jobs_skills.csv` (1.29M job_link → skills_list)
   - `data/processed/skill_vocabulary.csv`
   - `outputs/02_summary.txt`
 
 ### Stage 3 — Data Warehousing (`notebooks/03_data_warehouse.ipynb`, `src/warehouse.py`)
 **Status: complete.** Run with `python -m src.warehouse` (~5 s). Output: `data/processed/skillmap.db` (SQLite, ~50 MB) and `outputs/03_summary.txt`.
-- Fact table `job_postings` at (job, skill) grain: job_id, skill_id, location_id, company_id, time_id, salary_tier, experience_level, normalized_salary (358,080 rows). Jobs with no skills get one row with skill_id NULL
+- Fact table `job_postings` at (job, skill) grain: job_id, skill_id, location_id, company_id, time_id, salary_tier, experience_level, normalized_salary (337,421 rows). Jobs with no skills get one row with skill_id NULL
 - Dimensions:
   - `dim_skills`: skill_type 'extracted' = 100 matched_skills, 'category' = 35 LinkedIn categories
   - `dim_location`: city/state/location_type parsed from the raw string
@@ -142,8 +143,8 @@ Local environment: Homebrew Python blocks `pip install` (PEP 668), so the projec
 - Plot top skill co-occurrence network and save to `outputs/04_skill_network.png`
 
 **Status: complete.** Run with `python -m src.association` (~2 s). Transactions = `matched_skills`.
-- All jobs: 242 frequent itemsets, 38 rules pass the filters, graph has 34 skills / 139 edges. The plot draws edges with lift >= 1.2 (`PLOT_MIN_LIFT`)
-- High-tier jobs only: 123 rules → `outputs/04_high_salary_rules.csv`. Each rule has `jobs_with_itemset`, `high_tier_rate`, and `high_tier_lift` (High share among ALL jobs with the itemset ÷ 33.3% baseline), which shows whether a combination actually predicts High pay
+- All jobs: 241 frequent itemsets, 35 rules pass the filters, graph has 33 skills / 138 edges. The plot draws edges with lift >= 1.2 (`PLOT_MIN_LIFT`)
+- High-tier jobs only: 121 rules → `outputs/04_high_salary_rules.csv`. Each rule has `jobs_with_itemset`, `high_tier_rate`, and `high_tier_lift` (High share among ALL jobs with the itemset ÷ 33.3% baseline), which shows whether a combination actually predicts High pay
 - Summary: `outputs/04_summary.txt`
 
 ### Stage 5 — Classification (`notebooks/05_classification.ipynb`, `src/classification.py`)
@@ -160,6 +161,18 @@ Local environment: Homebrew Python blocks `pip install` (PEP 668), so the projec
   - Confusion matrix
 - Save best model to `outputs/05_best_model.pkl`
 - Save results comparison to `outputs/05_classification_results.csv`
+
+**Status: complete.** Run with `python -m src.classification` (~5 s). Features as specified by the user (multi-hot skills rather than TF-IDF):
+- `matched_skills` multi-hot (100 columns)
+- experience_level ordinal: Internship 0, Entry 1, Associate 2, Mid-Senior 3, Director 4, Executive 5, Unknown −1
+- company_size ordinal 0-8 binned from warehouse `employee_count`
+- top 20 states one-hot + Other
+- top 15 industries multi-hot + Other
+
+Top states and industries are chosen on the train split only.
+- Results (test): Random Forest F1 0.690 / AUC 0.862 (best, saved); XGBoost 0.667 / 0.847; LR 0.612 / 0.801. **F1 target not met, AUC target met**
+- Adding job_title TF-IDF (1-2 grams, 2,000 terms) to XGBoost gave F1 0.740 / AUC 0.895 in a quick experiment. This is the most promising way to close the F1 gap
+- Outputs: `05_classification_results.csv`, `05_best_model.pkl` (dict with model + feature metadata), `05_confusion_matrix.png`, `05_feature_importance.png`, `05_summary.txt`
 
 ### Stage 6 — Clustering (`notebooks/06_clustering.ipynb`, `src/clustering.py`)
 - Vectorize job postings using TF-IDF on skill columns

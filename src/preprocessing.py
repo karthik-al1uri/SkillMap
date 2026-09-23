@@ -88,6 +88,9 @@ POSTINGS_COLUMNS = [
     "min_salary", "max_salary", "med_salary", "pay_period", "currency", "normalized_salary",
     "description", "skills_desc",
 ]
+# A job ad reposted under several job_ids (often one per city) is kept once.
+DUPLICATE_POSTING_KEYS = ["company_name", "title", "description", "normalized_salary"]
+
 SALARY_COLUMNS = ["min_salary", "max_salary", "med_salary", "pay_period", "currency"]
 
 # ds_salaries experience codes mapped to LinkedIn's formatted_experience_level.
@@ -222,6 +225,19 @@ def filter_salary_rows(df: pd.DataFrame, stats: dict) -> pd.DataFrame:
     logger.info("Salary filter: -%d no salary, -%d non-USD, -%d implausible -> %d rows",
                 stats["dropped_no_salary"], stats["dropped_non_usd"],
                 stats["dropped_implausible_salary"], len(out))
+    return out.copy()
+
+
+def drop_duplicate_postings(df: pd.DataFrame, stats: dict) -> pd.DataFrame:
+    """Keep one row per reposted job ad: same company, title, description, and salary.
+
+    The same ad is often posted under several job_ids (e.g. once per city). Left in,
+    these copies land on both sides of a train/test split and inflate model scores.
+    """
+    out = df.drop_duplicates(subset=DUPLICATE_POSTING_KEYS, keep="first")
+    stats["dropped_duplicate_postings"] = len(df) - len(out)
+    logger.info("Dropped %d duplicate postings (same %s)", stats["dropped_duplicate_postings"],
+                ", ".join(DUPLICATE_POSTING_KEYS))
     return out.copy()
 
 
@@ -365,6 +381,7 @@ def build_cleaned_jobs(raw_dir: Path, stats: dict, vocab: pd.DataFrame) -> pd.Da
 
     df, stats["salary_values_annualized"] = annualize_salary(df)
     df = filter_salary_rows(df, stats)
+    df = drop_duplicate_postings(df, stats)
     df, stats["salary_values_imputed"] = impute_salary_by_experience(df)
 
     df["salary_tier"], stats["tier_thresholds"] = assign_salary_tier(df["normalized_salary"])
@@ -441,6 +458,8 @@ def build_summary(cleaned: pd.DataFrame, jobs_skills: pd.DataFrame, vocab: pd.Da
         f"Dropped: non-USD currency:                {stats['dropped_non_usd']:>8,}  {stats['non_usd_currencies']}",
         f"Dropped: salary outside [${MIN_PLAUSIBLE_SALARY:,}, ${MAX_PLAUSIBLE_SALARY:,}]: "
         f"{stats['dropped_implausible_salary']:>6,}",
+        f"Dropped: duplicate postings (same company/title/description/salary): "
+        f"{stats['dropped_duplicate_postings']:>4,}",
         f"Salaries imputed (experience median):     {stats['salary_values_imputed']:>8,}",
         f"Final rows:                               {stats['final_rows']:>8,}",
         "",

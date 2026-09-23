@@ -170,8 +170,13 @@ Local environment: Homebrew Python blocks `pip install` (PEP 668), so the projec
 - top 15 industries multi-hot + Other
 
 Top states and industries are chosen on the train split only.
-- Results (test): Random Forest F1 0.690 / AUC 0.862 (best, saved); XGBoost 0.667 / 0.847; LR 0.612 / 0.801. **F1 target not met, AUC target met**
-- Adding job_title TF-IDF (1-2 grams, 2,000 terms) to XGBoost gave F1 0.740 / AUC 0.895 in a quick experiment. This is the most promising way to close the F1 gap
+- Model 4 `XGBoost + title TF-IDF` = base features + TF-IDF of the top 50 job-title words (stop words removed, fit on train). Hyperparameters come from a 3-fold CV grid search on train only (~2.5 min); best was 600 trees, depth 8, lr 0.1, colsample 1.0
+- Results (test):
+  - XGBoost + title TF-IDF: F1 0.719 / AUC 0.884 (**best, saved**)
+  - Random Forest: 0.690 / 0.862
+  - XGBoost: 0.667 / 0.847
+  - LR: 0.612 / 0.801
+- **F1 > 0.75 target not met by any model; AUC target met by all.** Exploration: 2,000 title 1-2 grams reached ~0.74, still short. Errors are almost all at the Mid-tier boundary
 - Outputs: `05_classification_results.csv`, `05_best_model.pkl` (dict with model + feature metadata), `05_confusion_matrix.png`, `05_feature_importance.png`, `05_summary.txt`
 
 ### Stage 6 — Clustering (`notebooks/06_clustering.ipynb`, `src/clustering.py`)
@@ -184,6 +189,20 @@ Top states and industries are chosen on the train split only.
 - Label each cluster with top 5 skills
 - Save cluster assignments to `outputs/06_cluster_labels.csv`
 - Plot cluster visualization (PCA to 2D) and save to `outputs/06_clusters.png`
+
+**Status: complete.** Run with `python -m src.clustering` (~30 s). As requested by the user, the actual setup uses multi-hot `matched_skills` (not TF-IDF), K-Means k = 3-10 chosen by silhouette, and DBSCAN min_samples = 20.
+- **DBSCAN eps:** candidates are the √n steps of the k-distance staircase (10th-90th percentile). The pick is the best silhouette with ≥ 2 clusters and ≤ 50% noise
+- **Jobs with no matched skills:** 504, labelled −1
+- **Results:** targets **not met**
+  - K-Means k = 3: silhouette 0.03, DB 4.19. No elbow; silhouette < 0.04 for every k
+  - DBSCAN eps = 2.45: 2 clusters (99.9% in one), 14.7% noise, silhouette 0.17, DB 1.04
+  - TF-IDF → SVD(10) sensitivity check: silhouette 0.14
+  - Conclusion: skill profiles form a continuum
+- **Clusters (named via `SKILL_THEMES`; lift > 1 defines skills):**
+  - Management & Leadership (28%, mean $114k)
+  - Education & Training (27%, mean $80k)
+  - Generalist (few listed skills) (44%, mean $95k)
+- **Outputs:** `06_cluster_labels.csv`, `06_elbow_plot.png`, `06_kdistance_plot.png`, `06_clusters_pca.png`, `06_cluster_profiles.txt`, `06_summary.txt`
 
 ---
 

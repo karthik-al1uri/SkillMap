@@ -9,6 +9,11 @@ Predicts `salary_tier` (Low / Mid / High) from posting features:
 
 Top states and industries are chosen from the training split only.
 
+Model 4 (XGBoost + title TF-IDF) adds TF-IDF weights of the TITLE_TFIDF_MAX_FEATURES
+most frequent job-title words (English stop words removed, fit on the training split).
+Its hyperparameters are chosen by 3-fold cross-validated grid search on the training
+split only, so the test set is never used for tuning.
+
 Run from the project root with:
     python -m src.classification
 """
@@ -24,12 +29,14 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import scipy.sparse as sp
 from matplotlib.colors import LinearSegmentedColormap
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (accuracy_score, classification_report, confusion_matrix, f1_score,
                              roc_auc_score)
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import GridSearchCV, StratifiedKFold, train_test_split
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 from xgboost import XGBClassifier
@@ -42,6 +49,15 @@ RANDOM_STATE = 42
 TEST_SIZE = 0.2
 TOP_N_STATES = 20
 TOP_N_INDUSTRIES = 15
+TITLE_TFIDF_MAX_FEATURES = 50
+TITLE_MODEL_NAME = "XGBoost + title TF-IDF"
+# Grid searched for Model 4 with 3-fold CV (macro F1) on the training split.
+TITLE_MODEL_GRID = {
+    "n_estimators": [300, 600],
+    "max_depth": [6, 8],
+    "learning_rate": [0.05, 0.1],
+    "colsample_bytree": [0.5, 1.0],
+}
 F1_TARGET = 0.75
 AUC_TARGET = 0.80
 
@@ -136,6 +152,39 @@ def build_features(df: pd.DataFrame, skills: list, top: dict) -> pd.DataFrame:
     return pd.DataFrame(features, index=df.index)
 
 
+def build_title_features(train_titles: pd.Series, test_titles: pd.Series,
+                         X_train: pd.DataFrame, X_test: pd.DataFrame) -> tuple:
+    """Append job-title TF-IDF columns to the base features.
+
+    The vectorizer keeps the TITLE_TFIDF_MAX_FEATURES most frequent title words (English
+    stop words removed) and is fit on training titles only. Returns sparse train/test
+    matrices, the combined feature names, and the fitted vectorizer.
+    """
+    vectorizer = TfidfVectorizer(max_features=TITLE_TFIDF_MAX_FEATURES, stop_words="english")
+    title_train = vectorizer.fit_transform(train_titles)
+    title_test = vectorizer.transform(test_titles)
+    A_train = sp.hstack([sp.csr_matrix(X_train.to_numpy(dtype=float)), title_train]).tocsr()
+    A_test = sp.hstack([sp.csr_matrix(X_test.to_numpy(dtype=float)), title_test]).tocsr()
+    names = [*X_train.columns, *[f"title_{w}" for w in vectorizer.get_feature_names_out()]]
+    return A_train, A_test, names, vectorizer
+
+
+def tune_title_model(A_train, y_train) -> tuple:
+    """Grid-search XGBoost hyperparameters for Model 4 with 3-fold CV on the training split.
+
+    Returns the refit best estimator and a dict with the best params and CV macro F1.
+    """
+    search = GridSearchCV(
+        XGBClassifier(subsample=0.9, objective="multi:softprob", eval_metric="mlogloss",
+                      random_state=RANDOM_STATE, n_jobs=-1),
+        TITLE_MODEL_GRID, scoring="f1_macro",
+        cv=StratifiedKFold(n_splits=3, shuffle=True, random_state=RANDOM_STATE))
+    search.fit(A_train, y_train)
+    logger.info("%s grid search: best CV macro F1 %.3f with %s",
+                TITLE_MODEL_NAME, search.best_score_, search.best_params_)
+    return search.best_estimator_, {"best_params": search.best_params_, "cv_f1_macro": search.best_score_}
+
+
 def build_models() -> dict:
     """Return the three untrained classifiers, keyed by display name."""
     return {
@@ -164,7 +213,7 @@ def evaluate_model(model, X_train, y_train, X_test, y_test) -> dict:
 
 
 def train_and_evaluate(X_train, y_train, X_test, y_test) -> tuple:
-    """Fit all three models and return (fitted models, metrics per model)."""
+    """Fit the three base-feature models and return (fitted models, metrics per model)."""
     models, metrics = build_models(), {}
     for name, model in models.items():
         model.fit(X_train, y_train)
@@ -174,9 +223,22 @@ def train_and_evaluate(X_train, y_train, X_test, y_test) -> tuple:
     return models, metrics
 
 
+def train_title_model(A_train, y_train, A_test, y_test) -> tuple:
+    """Tune, fit, and evaluate Model 4 on base + title TF-IDF features.
+
+    Returns (fitted model, metrics, tuning info).
+    """
+    model, tuning = tune_title_model(A_train, y_train)
+    metrics = evaluate_model(model, A_train, y_train, A_test, y_test)
+    logger.info("%s: F1 macro %.3f, ROC-AUC %.3f", TITLE_MODEL_NAME,
+                metrics["f1_macro"], metrics["roc_auc_ovr"])
+    return model, metrics, tuning
+
+
 def results_table(metrics: dict) -> pd.DataFrame:
     """Return one row per model with the headline metrics, best F1 first."""
     rows = [{"model": name,
+             "features": "base + title TF-IDF" if name == TITLE_MODEL_NAME else "base",
              "f1_macro": m["f1_macro"],
              "roc_auc_ovr": m["roc_auc_ovr"],
              "accuracy": m["accuracy"],
@@ -206,7 +268,8 @@ def feature_importance(model, feature_names: list) -> pd.Series:
 
 def pretty_feature(name: str) -> str:
     """Turn a feature column name into a readable axis label."""
-    for prefix, label in [("skill_", "skill"), ("state_", "state"), ("industry_", "industry")]:
+    for prefix, label in [("skill_", "skill"), ("state_", "state"), ("industry_", "industry"),
+                          ("title_", "title word")]:
         if name.startswith(prefix):
             return f"{label}: {name[len(prefix):]}"
     return name.replace("_", " ")
@@ -237,6 +300,7 @@ def plot_feature_importance(importances: pd.Series, model_name: str, path: Path,
 IMPORTANCE_LABEL = {
     "Random Forest": "Importance (mean decrease in impurity)",
     "XGBoost": "Importance (share of total gain)",
+    TITLE_MODEL_NAME: "Importance (share of total gain)",
     "Logistic Regression": "Mean |standardized coefficient| across classes",
 }
 
@@ -244,9 +308,11 @@ IMPORTANCE_LABEL = {
 def plot_confusion_matrices(metrics: dict, path: Path) -> None:
     """Save one row-normalized confusion matrix per model, annotated with % and counts."""
     names = list(metrics)
-    fig, axes = plt.subplots(1, len(names), figsize=(5.2 * len(names), 5), dpi=150)
+    ncols = 2 if len(names) == 4 else len(names)
+    nrows = int(np.ceil(len(names) / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(5.4 * ncols, 5 * nrows), dpi=150)
     fig.patch.set_facecolor(SURFACE)
-    for ax, name in zip(axes, names):
+    for ax, name in zip(np.atleast_1d(axes).ravel(), names):
         cm = metrics[name]["confusion_matrix"]
         share = cm / cm.sum(axis=1, keepdims=True)
         ax.imshow(share, cmap=HEAT_RAMP, vmin=0, vmax=1)
@@ -272,8 +338,12 @@ def plot_confusion_matrices(metrics: dict, path: Path) -> None:
     logger.info("Saved %s", path)
 
 
-def save_best_model(model, name: str, feature_names: list, top: dict, skills: list, path: Path) -> None:
-    """Pickle the best model with everything needed to rebuild its features."""
+def save_best_model(model, name: str, feature_names: list, top: dict, skills: list, path: Path,
+                    title_vectorizer: TfidfVectorizer = None) -> None:
+    """Pickle the best model with everything needed to rebuild its features.
+
+    `title_vectorizer` is included when the best model uses title TF-IDF features.
+    """
     bundle = {
         "model_name": name,
         "model": model,
@@ -284,6 +354,7 @@ def save_best_model(model, name: str, feature_names: list, top: dict, skills: li
         "company_size_bins": COMPANY_SIZE_BINS,
         "tier_labels": TIER_LABELS,
         "random_state": RANDOM_STATE,
+        "title_vectorizer": title_vectorizer,
     }
     with open(path, "wb") as f:
         pickle.dump(bundle, f)
@@ -291,7 +362,8 @@ def save_best_model(model, name: str, feature_names: list, top: dict, skills: li
 
 
 def build_summary(df: pd.DataFrame, X: pd.DataFrame, n_train: int, n_test: int, top: dict,
-                  table: pd.DataFrame, metrics: dict, best: str, importances: pd.Series) -> str:
+                  table: pd.DataFrame, metrics: dict, best: str, importances: pd.Series,
+                  title_words: list = None, tuning: dict = None) -> str:
     """Build the plain-text Stage 5 summary."""
     line = "=" * 80
     best_row = table.iloc[0]
@@ -312,6 +384,9 @@ def build_summary(df: pd.DataFrame, X: pd.DataFrame, n_train: int, n_test: int, 
         size_counts.to_string(),
         f"state one-hot, top {TOP_N_STATES} + Other (Other includes jobs with no state): {top['states']}",
         f"industry multi-hot, top {TOP_N_INDUSTRIES} + Other: {top['industries']}",
+        *([f"Model 4 adds title TF-IDF, top {len(title_words)} words (stop words removed): {title_words}",
+           f"Model 4 hyperparameters (3-fold CV on train, macro F1 {tuning['cv_f1_macro']:.3f}): "
+           f"{tuning['best_params']}"] if title_words else []),
         "",
         f"{line}\nResults (test set)\n{line}",
         table.to_string(index=False),
@@ -352,21 +427,32 @@ def run_pipeline(project_root: Path = None) -> dict:
     logger.info("Features: %d columns; train %d, test %d", X_train.shape[1], len(X_train), len(X_test))
 
     models, metrics = train_and_evaluate(X_train, y_train, X_test, y_test)
+    A_train, A_test, title_names, vectorizer = build_title_features(
+        train_df["job_title"], test_df["job_title"], X_train, X_test)
+    models[TITLE_MODEL_NAME], metrics[TITLE_MODEL_NAME], tuning = train_title_model(
+        A_train, y_train, A_test, y_test)
+
     table = results_table(metrics)
     table.to_csv(output_dir / "05_classification_results.csv", index=False)
     best = table.iloc[0]["model"]
+    uses_title = best == TITLE_MODEL_NAME
+    feature_names = title_names if uses_title else list(X_train.columns)
 
-    importances = feature_importance(models[best], list(X_train.columns))
+    importances = feature_importance(models[best], feature_names)
     plot_feature_importance(importances, best, output_dir / "05_feature_importance.png")
     plot_confusion_matrices(metrics, output_dir / "05_confusion_matrix.png")
-    save_best_model(models[best], best, list(X_train.columns), top, skills, output_dir / "05_best_model.pkl")
+    save_best_model(models[best], best, feature_names, top, skills, output_dir / "05_best_model.pkl",
+                    title_vectorizer=vectorizer if uses_title else None)
 
-    summary = build_summary(df, X_train, len(X_train), len(X_test), top, table, metrics, best, importances)
+    title_words = list(vectorizer.get_feature_names_out())
+    summary = build_summary(df, X_train, len(X_train), len(X_test), top, table, metrics, best, importances,
+                            title_words=title_words, tuning=tuning)
     (output_dir / "05_summary.txt").write_text(summary, encoding="utf-8")
     logger.info("Saved %s", output_dir / "05_summary.txt")
     return {"models": models, "metrics": metrics, "table": table, "best": best,
             "importances": importances, "X_train": X_train, "X_test": X_test,
-            "y_train": y_train, "y_test": y_test, "top": top, "summary": summary}
+            "y_train": y_train, "y_test": y_test, "top": top, "summary": summary,
+            "A_train": A_train, "A_test": A_test, "title_vectorizer": vectorizer, "tuning": tuning}
 
 
 if __name__ == "__main__":

@@ -94,6 +94,8 @@ Install all with:
 pip install -r requirements.txt
 ```
 
+Local environment: Homebrew Python blocks `pip install` (PEP 668), so the project uses `.venv/` (gitignored), created with `--system-site-packages`. It reuses the system pandas/numpy/matplotlib/networkx/sklearn and adds mlxtend and ipython. Run pipelines with `.venv/bin/python -m src.<module>`.
+
 ---
 
 ## Pipeline Instructions
@@ -110,7 +112,7 @@ pip install -r requirements.txt
 - Normalize job titles to lowercase and strip whitespace
 - Salary: `normalized_salary` is primary (pay_period annualized: hourly x2080, weekly x52, biweekly x26, monthly x12). Drop rows with no salary, non-USD rows, and salaries outside $10k-$1M. Impute remaining gaps by `experience_level` median
 - Discretize salary into three tiers at the 33rd/66th percentiles: Low (<= $62,400), Mid (<= $109,352), High
-- `skills_list` = 35 coarse job-function categories. `matched_skills` = concrete skills: the top 100 skills from `linkedin_jobs/job_skills.csv` (spelling variants and `SKILL_SYNONYMS` merged, `EXCLUDED_TERMS` removed), regex-matched in each posting's description. **Stages 4-6 should use `matched_skills`**
+- `skills_list` = 35 coarse job-function categories. `matched_skills` = concrete skills: the top 100 skills from `linkedin_jobs/job_skills.csv` (spelling variants and `SKILL_SYNONYMS` merged, `EXCLUDED_TERMS` removed), regex-matched in each posting's description. Phrases containing another skill ("project management" ⊃ "management") are matched first and blanked out of the text, so there are no tautological rules. **Stages 4-6 should use `matched_skills`**
 - Outputs:
   - `data/processed/cleaned_jobs.csv` (35,604 rows): job_id, job_title, company_name, location, experience_level, industry, skills_list, matched_skills, normalized_salary, salary_tier. Read it with `src.preprocessing.load_cleaned_jobs()` so the list columns are parsed
   - `data/processed/linkedin_jobs_skills.csv` (1.29M job_link → skills_list)
@@ -138,6 +140,11 @@ pip install -r requirements.txt
 - Build a skill co-occurrence graph using NetworkX
 - Output top 20 rules sorted by lift to `outputs/04_association_rules.csv`
 - Plot top skill co-occurrence network and save to `outputs/04_skill_network.png`
+
+**Status: complete.** Run with `python -m src.association` (~2 s). Transactions = `matched_skills`.
+- All jobs: 242 frequent itemsets, 38 rules pass the filters, graph has 34 skills / 139 edges. The plot draws edges with lift >= 1.2 (`PLOT_MIN_LIFT`)
+- High-tier jobs only: 123 rules → `outputs/04_high_salary_rules.csv`. Each rule has `jobs_with_itemset`, `high_tier_rate`, and `high_tier_lift` (High share among ALL jobs with the itemset ÷ 33.3% baseline), which shows whether a combination actually predicts High pay
+- Summary: `outputs/04_summary.txt`
 
 ### Stage 5 — Classification (`notebooks/05_classification.ipynb`, `src/classification.py`)
 - Features: extracted skills (TF-IDF), experience_level, company_size, location, industry

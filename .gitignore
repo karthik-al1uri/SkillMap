@@ -3,6 +3,7 @@ data/raw/
 data/processed/
 outputs/*
 !outputs/.gitkeep
+!outputs/progress_report.md
 *.csv
 *.json
 

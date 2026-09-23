@@ -1,0 +1,17 @@
+# Data and pipeline outputs — large files, never pushed
+data/raw/
+data/processed/
+outputs/*
+!outputs/.gitkeep
+*.csv
+*.json
+
+# Python / Jupyter
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.venv/
+venv/
+
+# OS
+.DS_Store

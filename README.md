@@ -50,7 +50,7 @@ data/raw/
 | 2 | Preprocessing and cleaning | `notebooks/02_preprocessing.ipynb`, `src/preprocessing.py` | ✅ Done |
 | 3 | Data warehousing (SQLite star schema) | `notebooks/03_data_warehouse.ipynb`, `src/warehouse.py` | ✅ Done |
 | 4 | Association rule mining and classification | `notebooks/04_association_mining.ipynb`, `notebooks/05_classification.ipynb`, `src/association.py`, `src/classification.py` | ✅ Done |
-| 5 | Clustering and outlier detection | `notebooks/06_clustering.ipynb` | ⏳ Planned |
+| 5 | Clustering and outlier detection | `notebooks/06_clustering.ipynb`, `src/clustering.py` | ✅ Done |
 | 6 | Evaluation and visualization | `outputs/` | ⏳ Planned |
 
 **Phase 1 — Ingestion.** Load every raw table and record its shape, dtypes, null rates, duplicates, and key columns in `outputs/01_summary.txt`.
@@ -59,9 +59,9 @@ data/raw/
 
 **Phase 3 — Warehousing.** Build a SQLite star schema in `data/processed/skillmap.db`: a `job_postings` fact table at (job, skill) grain; skill, location, company, time, and industry dimensions; and a one-row-per-job `v_jobs` view. Then run OLAP queries for top skills, salary by experience level, and jobs by industry × state. Run with `python -m src.warehouse`.
 
-**Phase 4 — Association mining and classification.** Mine skill association rules with Apriori (support ≥ 0.05, confidence > 0.5, lift > 1.5) and build a skill co-occurrence network. Mining is repeated on High-tier jobs, and each rule is scored by how much more likely jobs with that skill set are to be High-paying (`python -m src.association`). Headline result: 81% of jobs listing both python and engineering are High tier (2.4× the baseline). Predict salary tier with Logistic Regression, Random Forest, and XGBoost (targets: macro F1 > 0.75, ROC-AUC > 0.80; `python -m src.classification`). Best: Random Forest with macro F1 0.690 and ROC-AUC 0.862, so the AUC target is met but the F1 target is not. Experience level and company size are the strongest predictors.
+**Phase 4 — Association mining and classification.** Mine skill association rules with Apriori (support ≥ 0.05, confidence > 0.5, lift > 1.5) and build a skill co-occurrence network. Mining is repeated on High-tier jobs, and each rule is scored by how much more likely jobs with that skill set are to be High-paying (`python -m src.association`). Headline result: 81% of jobs listing both python and engineering are High tier (2.4× the baseline). Predict salary tier with Logistic Regression, Random Forest, and XGBoost (targets: macro F1 > 0.75, ROC-AUC > 0.80; `python -m src.classification`). A fourth model adds TF-IDF of the top 50 job-title words to XGBoost (tuned with cross-validation on the training data). It is the best model, with macro F1 0.719 and ROC-AUC 0.884, so the AUC target is met but the F1 target is not. Credentials, industry, experience level, and title words (engineer, senior) are the strongest predictors.
 
-**Phase 5 — Clustering.** Cluster TF-IDF skill vectors with K-Means and DBSCAN to find role archetypes (targets: silhouette > 0.50, Davies-Bouldin < 1.0).
+**Phase 5 — Clustering.** Cluster multi-hot skill vectors with K-Means (k = 3-10, chosen by silhouette) and DBSCAN (eps tuned from the k-distance graph) to find role archetypes (targets: silhouette > 0.50, Davies-Bouldin < 1.0; `python -m src.clustering`). Neither method meets the targets (best K-Means silhouette 0.03), so skill profiles form a continuum rather than distinct archetypes. The K-Means clusters still differ in pay: Management & Leadership averages $114k and Education & Training $80k.
 
 **Phase 6 — Evaluation and visualization.** Compare the models and produce the final figures and report.
 

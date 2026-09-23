@@ -318,14 +318,29 @@ def skill_pattern(forms: list) -> str:
 def match_description_skills(df: pd.DataFrame, vocab: pd.DataFrame) -> pd.Series:
     """Return a `matched_skills` list per row: vocabulary skills found in description + skills_desc.
 
+    Skills whose phrase contains another vocabulary skill (e.g. "project management"
+    contains "management") are matched first, longest first, and their matches are blanked
+    out of the text. The shorter skill then counts only where it appears on its own,
+    which avoids tautological association rules like project management -> management.
     Skills are listed in vocabulary order (most common first).
     """
     text = (df["description"].fillna("") + " " + df["skills_desc"].fillna("")).str.lower()
-    hits = pd.DataFrame(
-        {row.skill: text.str.contains(skill_pattern(row.forms), regex=True) for row in vocab.itertuples()},
-        index=df.index,
-    )
+    patterns = {row.skill: skill_pattern(row.forms) for row in vocab.itertuples()}
+    forms = dict(zip(vocab["skill"], vocab["forms"]))
+    containers = [skill for skill in patterns
+                  if any(other != skill and re.search(patterns[other], form)
+                         for other in patterns for form in forms[skill])]
+
+    hits = {}
+    for skill in sorted(containers, key=lambda s: max(len(f) for f in forms[s]), reverse=True):
+        hits[skill] = text.str.contains(patterns[skill], regex=True)
+        text = text.str.replace(patterns[skill], " ", regex=True)
+    for skill in patterns:
+        if skill not in hits:
+            hits[skill] = text.str.contains(patterns[skill], regex=True)
+    hits = pd.DataFrame(hits, index=df.index)[list(patterns)]
     matched = hits.apply(lambda row: row.index[row.to_numpy()].tolist(), axis=1)
+    logger.info("Matched skills: %d nested phrases matched first (%s)", len(containers), ", ".join(containers))
     logger.info("Matched description skills: %d of %d jobs have at least one, mean %.1f per job",
                 int((matched.str.len() > 0).sum()), len(matched), matched.str.len().mean())
     return matched

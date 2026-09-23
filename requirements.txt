@@ -1,0 +1,12 @@
+pandas>=2.0
+numpy>=1.24
+spacy>=3.7
+nltk>=3.8
+mlxtend>=0.23
+scikit-learn>=1.3
+xgboost>=2.0
+networkx>=3.1
+matplotlib>=3.7
+plotly>=5.18
+jupyter>=1.0
+ipykernel>=6.25

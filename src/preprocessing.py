@@ -5,11 +5,16 @@ dataset (`data/raw/linkedin_postings/`), plus a cleaned per-job skill list from 
 1.3M LinkedIn Jobs & Skills dataset for later association mining, and benchmarks
 the salary tiers against the Data Science Salaries dataset.
 
+Postings only carry 35 coarse job-function categories as skills, so the top
+TOP_N_SKILLS skills from the 1.3M dataset are used as a vocabulary and matched
+against each posting's description to produce `matched_skills`.
+
 Run from the project root with:
     python -m src.preprocessing
 """
 import ast
 import logging
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -35,17 +40,53 @@ PAY_PERIOD_TO_ANNUAL = {
 MIN_PLAUSIBLE_SALARY = 10_000
 MAX_PLAUSIBLE_SALARY = 1_000_000
 
+# Size of the skill vocabulary taken from linkedin_jobs_skills for description matching.
+TOP_N_SKILLS = 100
+
+# Frequent linkedin_jobs "skills" that are benefits or legal boilerplate, not skills.
+# Excluded before taking the top N. Empty this set to keep them.
+EXCLUDED_TERMS = {
+    "paid time off", "401k", "life insurance", "dental insurance", "vision insurance",
+    "health insurance", "equal opportunity employer",
+    # Mostly match description boilerplate ("medical, dental, vision", "hiring manager",
+    # EEO statements) rather than a skill requirement.
+    "medical", "vision", "diversity", "hiring",
+}
+
+# Near-duplicate skills merged into one canonical skill (variant -> canonical).
+SKILL_SYNONYMS = {
+    "communication skills": "communication",
+    "leadership skills": "leadership",
+    "problemsolving skills": "problem solving",
+    "problem solving skills": "problem solving",
+    "microsoft office suite": "microsoft office",
+    "microsoft excel": "excel",
+    "high school diploma or equivalent": "high school diploma",
+    "high school diploma or ged": "high school diploma",
+    "bls certification": "bls",
+    "cpr certification": "cpr",
+    "valid driver's license": "driver's license",
+    "retail experience": "retail",
+    "organizational skills": "organization",
+}
+
+# A spelling variant is searched for only if it accounts for at least this share of its
+# skill's job count, which drops rare typos such as "micro soft office".
+MIN_VARIANT_SHARE = 0.01
+
 TIER_QUANTILES = (1 / 3, 2 / 3)
 TIER_LABELS = ["Low", "Mid", "High"]
 
 OUTPUT_COLUMNS = [
     "job_id", "job_title", "company_name", "location", "experience_level",
-    "industry", "skills_list", "normalized_salary", "salary_tier",
+    "industry", "skills_list", "matched_skills", "normalized_salary", "salary_tier",
 ]
+LIST_COLUMNS = ["skills_list", "matched_skills"]
 
 POSTINGS_COLUMNS = [
     "job_id", "title", "company_name", "location", "formatted_experience_level",
     "min_salary", "max_salary", "med_salary", "pay_period", "currency", "normalized_salary",
+    "description", "skills_desc",
 ]
 SALARY_COLUMNS = ["min_salary", "max_salary", "med_salary", "pay_period", "currency"]
 
@@ -211,8 +252,90 @@ def assign_salary_tier(salary: pd.Series) -> tuple:
     return tiers.astype(str), (p33, p66)
 
 
-def build_cleaned_jobs(raw_dir: Path, stats: dict) -> pd.DataFrame:
-    """Run the full postings cleaning pipeline and return the final cleaned_jobs frame."""
+def skill_key(skill: str) -> str:
+    """Return a spelling-insensitive key for a skill (letters, digits, and + # only)."""
+    return re.sub(r"[^a-z0-9+#]", "", skill.lower())
+
+
+def clean_skill_form(skill: str) -> str:
+    """Strip leading bullets/symbols and trailing punctuation from a raw skill string."""
+    skill = re.sub(r"^[^a-z0-9]+|[^a-z0-9+#]+$", "", skill.lower())
+    return " ".join(skill.split())
+
+
+def build_skill_vocabulary(jobs_skills: pd.DataFrame, top_n: int = TOP_N_SKILLS) -> pd.DataFrame:
+    """Return the `top_n` most common skills in `jobs_skills` after merging variants.
+
+    Raw skills are grouped when they differ only in spacing or punctuation (e.g. "problem
+    solving", "problemsolving", "* problem solving.") or are listed in SKILL_SYNONYMS.
+    Skills in EXCLUDED_TERMS are removed. Each skill is named after its most frequent
+    form, and job counts are summed across its variants.
+
+    Columns: skill, job_count, n_variants, forms (the spellings searched for in text).
+    """
+    counts = jobs_skills["skills_list"].explode().value_counts()
+    variants = counts.rename("job_count").rename_axis("raw").reset_index()
+    variants["form"] = variants["raw"].map(clean_skill_form)
+    variants["key"] = variants["form"].map(skill_key)
+    variants = variants[variants["key"] != ""]
+
+    synonym_keys = {skill_key(k): skill_key(v) for k, v in SKILL_SYNONYMS.items()}
+    variants["group"] = variants["key"].replace(synonym_keys)
+    excluded_keys = {skill_key(t) for t in EXCLUDED_TERMS}
+    variants = variants[~variants["group"].isin(excluded_keys)]
+
+    forms = (variants.groupby(["group", "form"], sort=False)["job_count"].sum()
+             .reset_index().sort_values("job_count", ascending=False))
+    totals = forms.groupby("group")["job_count"].transform("sum")
+    forms["searched"] = (forms["job_count"] >= MIN_VARIANT_SHARE * totals) & forms["form"].str.isascii()
+
+    # Name each group after its most frequent form, unless that form is a synonym source.
+    canonical = {skill_key(v): v for v in SKILL_SYNONYMS.values()}
+    vocab = (forms.groupby("group", sort=False)
+             .agg(skill=("form", "first"), job_count=("job_count", "sum"), n_variants=("form", "size"))
+             .join(forms[forms["searched"]].groupby("group")["form"].agg(list).rename("forms")))
+    vocab["skill"] = [canonical.get(g, name) for g, name in zip(vocab.index, vocab["skill"])]
+    vocab = vocab.sort_values("job_count", ascending=False).head(top_n).reset_index(drop=True)
+    logger.info("Built skill vocabulary: top %d of %d distinct raw skills (%d terms excluded)",
+                len(vocab), len(counts), len(EXCLUDED_TERMS))
+    return vocab
+
+
+def skill_pattern(forms: list) -> str:
+    """Build a regex matching any of a skill's `forms` as a whole phrase in lowercase text.
+
+    Words may be separated by whitespace, hyphens, or nothing, so "problem solving",
+    "problem-solving", and "problemsolving" all match. Custom boundaries are used instead
+    of \\b so skills ending in symbols (e.g. "c++") still match.
+    """
+    alternatives = []
+    for form in forms:
+        words = [re.escape(w) for w in re.split(r"[\s\-]+", form) if w]
+        alternatives.append(r"[\s\-]*".join(words))
+    return r"(?<![a-z0-9])(?:" + "|".join(alternatives) + r")(?![a-z0-9])"
+
+
+def match_description_skills(df: pd.DataFrame, vocab: pd.DataFrame) -> pd.Series:
+    """Return a `matched_skills` list per row: vocabulary skills found in description + skills_desc.
+
+    Skills are listed in vocabulary order (most common first).
+    """
+    text = (df["description"].fillna("") + " " + df["skills_desc"].fillna("")).str.lower()
+    hits = pd.DataFrame(
+        {row.skill: text.str.contains(skill_pattern(row.forms), regex=True) for row in vocab.itertuples()},
+        index=df.index,
+    )
+    matched = hits.apply(lambda row: row.index[row.to_numpy()].tolist(), axis=1)
+    logger.info("Matched description skills: %d of %d jobs have at least one, mean %.1f per job",
+                int((matched.str.len() > 0).sum()), len(matched), matched.str.len().mean())
+    return matched
+
+
+def build_cleaned_jobs(raw_dir: Path, stats: dict, vocab: pd.DataFrame) -> pd.DataFrame:
+    """Run the full postings cleaning pipeline and return the final cleaned_jobs frame.
+
+    `vocab` is the skill vocabulary from build_skill_vocabulary, used for `matched_skills`.
+    """
     df = load_postings(raw_dir)
     stats["postings_rows"] = len(df)
     before = len(df)
@@ -231,6 +354,7 @@ def build_cleaned_jobs(raw_dir: Path, stats: dict) -> pd.DataFrame:
 
     df["salary_tier"], stats["tier_thresholds"] = assign_salary_tier(df["normalized_salary"])
     df["normalized_salary"] = df["normalized_salary"].round(2)
+    df["matched_skills"] = match_description_skills(df, vocab)
     stats["final_rows"] = len(df)
     return df[OUTPUT_COLUMNS].reset_index(drop=True)
 
@@ -269,19 +393,26 @@ def benchmark_ds_salaries(raw_dir: Path, thresholds: tuple, cleaned: pd.DataFram
 
 
 def load_cleaned_jobs(path: Path) -> pd.DataFrame:
-    """Read cleaned_jobs.csv back, parsing `skills_list` from its string form into Python lists."""
+    """Read cleaned_jobs.csv back, parsing the list columns from their string form into Python lists."""
     df = pd.read_csv(path)
-    df["skills_list"] = df["skills_list"].apply(ast.literal_eval)
+    for col in LIST_COLUMNS:
+        df[col] = df[col].apply(ast.literal_eval)
     return df
 
 
-def build_summary(cleaned: pd.DataFrame, jobs_skills: pd.DataFrame, stats: dict, benchmark: dict) -> str:
+def build_summary(cleaned: pd.DataFrame, jobs_skills: pd.DataFrame, vocab: pd.DataFrame,
+                  stats: dict, benchmark: dict) -> str:
     """Build the plain-text Stage 2 preprocessing summary."""
     line = "=" * 80
     p33, p66 = stats["tier_thresholds"]
     ds33, ds66 = benchmark["ds_thresholds"]
     skill_counts = cleaned["skills_list"].explode().value_counts()
     jobs_skill_counts = jobs_skills["skills_list"].explode().value_counts()
+    matched_counts = cleaned["matched_skills"].explode().value_counts()
+    unmatched = [s for s in vocab["skill"] if s not in matched_counts.index]
+    tier_by_skill = (cleaned[["matched_skills", "normalized_salary"]].explode("matched_skills")
+                     .groupby("matched_skills")["normalized_salary"].agg(["count", "median"])
+                     .query("count >= 200").sort_values("median", ascending=False))
     parts = [
         "SkillMap — Stage 2 Preprocessing Summary",
         f"Generated: {datetime.now():%Y-%m-%d %H:%M:%S}",
@@ -319,6 +450,23 @@ def build_summary(cleaned: pd.DataFrame, jobs_skills: pd.DataFrame, stats: dict,
         f"Jobs with no skills: {int((cleaned['skills_list'].str.len() == 0).sum()):,}",
         f"Mean skills per job: {cleaned['skills_list'].str.len().mean():.2f}",
         skill_counts.head(15).to_string(),
+        "",
+        f"-- Matched skills (top {len(vocab)} linkedin_jobs skills found in descriptions) --",
+        f"Jobs with >= 1 matched skill: {int((cleaned['matched_skills'].str.len() > 0).sum()):,} "
+        f"of {len(cleaned):,}",
+        f"Mean matched skills per job: {cleaned['matched_skills'].str.len().mean():.1f}",
+        f"Vocabulary skills never matched: {unmatched if unmatched else 'none'}",
+        f"Excluded non-skill terms: {sorted(EXCLUDED_TERMS)}",
+        f"Synonyms merged: {SKILL_SYNONYMS}",
+        "Spelling variants per skill are listed in data/processed/skill_vocabulary.csv",
+        "Most frequent matched skills:",
+        matched_counts.head(20).to_string(),
+        "",
+        "Highest median salary by matched skill (skills in >= 200 jobs):",
+        tier_by_skill.head(10).round(0).to_string(),
+        "",
+        "Lowest median salary by matched skill (skills in >= 200 jobs):",
+        tier_by_skill.tail(10).round(0).to_string(),
         "",
         "-- Top industries --",
         f"Jobs with Unknown industry: {int((cleaned['industry'] == 'Unknown').sum()):,}",
@@ -358,8 +506,9 @@ def run_pipeline(project_root: Path = None) -> dict:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     stats = {}
-    cleaned = build_cleaned_jobs(raw_dir, stats)
     jobs_skills = load_linkedin_jobs_skills(raw_dir)
+    vocab = build_skill_vocabulary(jobs_skills)
+    cleaned = build_cleaned_jobs(raw_dir, stats, vocab)
     benchmark = benchmark_ds_salaries(raw_dir, stats["tier_thresholds"], cleaned)
 
     cleaned_path = processed_dir / "cleaned_jobs.csv"
@@ -370,12 +519,16 @@ def run_pipeline(project_root: Path = None) -> dict:
     jobs_skills.to_csv(jobs_skills_path, index=False)
     logger.info("Saved %s (%d rows)", jobs_skills_path, len(jobs_skills))
 
-    summary = build_summary(cleaned, jobs_skills, stats, benchmark)
+    vocab_path = processed_dir / "skill_vocabulary.csv"
+    vocab.to_csv(vocab_path, index=False)
+    logger.info("Saved %s (%d skills)", vocab_path, len(vocab))
+
+    summary = build_summary(cleaned, jobs_skills, vocab, stats, benchmark)
     summary_path = output_dir / "02_summary.txt"
     summary_path.write_text(summary, encoding="utf-8")
     logger.info("Saved %s", summary_path)
 
-    return {"cleaned": cleaned, "jobs_skills": jobs_skills, "stats": stats,
+    return {"cleaned": cleaned, "jobs_skills": jobs_skills, "vocab": vocab, "stats": stats,
             "benchmark": benchmark, "summary": summary}
 
 

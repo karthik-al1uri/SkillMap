@@ -48,16 +48,16 @@ data/raw/
 |---|---|---|---|
 | 1 | Data acquisition and ingestion | `notebooks/01_data_ingestion.ipynb` | ✅ Done |
 | 2 | Preprocessing and cleaning | `notebooks/02_preprocessing.ipynb`, `src/preprocessing.py` | ✅ Done |
-| 3 | Data warehousing (SQLite star schema) and EDA | `notebooks/03_data_warehouse.ipynb` | ⏳ Planned |
+| 3 | Data warehousing (SQLite star schema) | `notebooks/03_data_warehouse.ipynb`, `src/warehouse.py` | ✅ Done |
 | 4 | Association rule mining and classification | `notebooks/04_association_mining.ipynb`, `notebooks/05_classification.ipynb` | ⏳ Planned |
 | 5 | Clustering and outlier detection | `notebooks/06_clustering.ipynb` | ⏳ Planned |
 | 6 | Evaluation and visualization | `outputs/` | ⏳ Planned |
 
 **Phase 1 — Ingestion.** Load every raw table and record its shape, dtypes, null rates, duplicates, and key columns in `outputs/01_summary.txt`.
 
-**Phase 2 — Preprocessing.** Join the postings tables (salaries, skills, industries), normalize titles, annualize salaries by `pay_period`, drop rows with no salary or implausible salary, impute by experience-level median, and bin salary into Low / Mid / High tiers at the 33rd and 66th percentiles. Outputs `data/processed/cleaned_jobs.csv` (35,604 jobs) and `data/processed/linkedin_jobs_skills.csv` (1.29M per-job skill lists). Run with `python -m src.preprocessing`.
+**Phase 2 — Preprocessing.** Join the postings tables (salaries, skills, industries), normalize titles, annualize salaries by `pay_period`, drop rows with no salary or implausible salary, impute by experience-level median, and bin salary into Low / Mid / High tiers at the 33rd and 66th percentiles. The top 100 skills from the 1.3M LinkedIn Jobs dataset are matched in each posting's description to produce `matched_skills`. Outputs `data/processed/cleaned_jobs.csv` (35,604 jobs) and `data/processed/linkedin_jobs_skills.csv` (1.29M per-job skill lists). Run with `python -m src.preprocessing`.
 
-**Phase 3 — Warehousing.** Build a star schema (`job_postings` fact table; skill, location, company, and time dimensions) in SQLite and run OLAP queries.
+**Phase 3 — Warehousing.** Build a SQLite star schema in `data/processed/skillmap.db`: a `job_postings` fact table at (job, skill) grain; skill, location, company, time, and industry dimensions; and a one-row-per-job `v_jobs` view. Then run OLAP queries for top skills, salary by experience level, and jobs by industry × state. Run with `python -m src.warehouse`.
 
 **Phase 4 — Association mining and classification.** Mine skill association rules with Apriori (support ≥ 0.05, confidence > 0.5, lift > 1.5) and build a skill co-occurrence network. Predict salary tier with Logistic Regression, Random Forest, and XGBoost (targets: macro F1 > 0.75, ROC-AUC > 0.80).
 

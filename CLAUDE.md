@@ -30,6 +30,7 @@ SkillMap/
 │   └── 06_clustering.ipynb
 ├── src/
 │   ├── preprocessing.py
+│   ├── warehouse.py
 │   ├── association.py
 │   ├── classification.py
 │   └── clustering.py
@@ -104,23 +105,29 @@ pip install -r requirements.txt
 - Save a merged exploration summary to `outputs/01_summary.txt`
 
 ### Stage 2 — Data Preprocessing (`notebooks/02_preprocessing.ipynb`, `src/preprocessing.py`)
-- Drop duplicate rows and irrelevant columns
+**Status: complete.** Run with `python -m src.preprocessing` (~3 min).
+- Main table: `linkedin_postings/postings.csv`, joined with `jobs/salaries.csv`, `jobs/job_skills.csv` + `mappings/skills.csv`, and `jobs/job_industries.csv` + `mappings/industries.csv`
 - Normalize job titles to lowercase and strip whitespace
-- Extract skills from job descriptions using spaCy and a keyword list
-- Impute missing salary values using median grouped by job_title and experience_level
-- Discretize salary into three tiers: Low (bottom 33%), Mid (33-66%), High (top 33%)
-- Save cleaned dataset to `data/processed/cleaned_jobs.csv`
+- Salary: `normalized_salary` is primary (pay_period annualized: hourly x2080, weekly x52, biweekly x26, monthly x12). Drop rows with no salary, non-USD rows, and salaries outside $10k-$1M. Impute remaining gaps by `experience_level` median
+- Discretize salary into three tiers at the 33rd/66th percentiles: Low (<= $62,400), Mid (<= $109,352), High
+- `skills_list` = 35 coarse job-function categories. `matched_skills` = concrete skills: the top 100 skills from `linkedin_jobs/job_skills.csv` (spelling variants and `SKILL_SYNONYMS` merged, `EXCLUDED_TERMS` removed), regex-matched in each posting's description. **Stages 4-6 should use `matched_skills`**
+- Outputs:
+  - `data/processed/cleaned_jobs.csv` (35,604 rows): job_id, job_title, company_name, location, experience_level, industry, skills_list, matched_skills, normalized_salary, salary_tier. Read it with `src.preprocessing.load_cleaned_jobs()` so the list columns are parsed
+  - `data/processed/linkedin_jobs_skills.csv` (1.29M job_link → skills_list)
+  - `data/processed/skill_vocabulary.csv`
+  - `outputs/02_summary.txt`
 
-### Stage 3 — Data Warehousing (`notebooks/03_data_warehouse.ipynb`)
-- Design a star schema:
-  - Fact table: job_postings (job_id, skill_id, location_id, company_id, salary_tier, experience_level)
-  - Dimension tables: dim_skills, dim_location, dim_company, dim_time
-- Load into SQLite using pandas and sqlite3
-- Run 3 sample OLAP queries:
-  1. Top 10 most demanded skills
-  2. Average salary by experience level
-  3. Job count by industry and location
-- Save database to `data/processed/skillmap.db`
+### Stage 3 — Data Warehousing (`notebooks/03_data_warehouse.ipynb`, `src/warehouse.py`)
+**Status: complete.** Run with `python -m src.warehouse` (~5 s). Output: `data/processed/skillmap.db` (SQLite, ~50 MB) and `outputs/03_summary.txt`.
+- Fact table `job_postings` at (job, skill) grain: job_id, skill_id, location_id, company_id, time_id, salary_tier, experience_level, normalized_salary (358,080 rows). Jobs with no skills get one row with skill_id NULL
+- Dimensions:
+  - `dim_skills`: skill_type 'extracted' = 100 matched_skills, 'category' = 35 LinkedIn categories
+  - `dim_location`: city/state/location_type parsed from the raw string
+  - `dim_company`: company_size 0-7, latest employee_count; company_id 0 = Unknown
+  - `dim_time`: time_id YYYYMMDD, from original_listed_time
+  - `dim_industry` + `bridge_job_industry` (jobs have up to 3 industries)
+- **`v_jobs` view = one row per job. Use it for any salary aggregate**, since the fact table repeats salary per skill
+- OLAP queries (in `src/warehouse.OLAP_QUERIES`): top 10 skills, average salary by experience level, job count by industry × state
 
 ### Stage 4 — Association Rule Mining (`notebooks/04_association_mining.ipynb`, `src/association.py`)
 - Load skill lists per job posting as transactions
@@ -157,6 +164,35 @@ pip install -r requirements.txt
 - Label each cluster with top 5 skills
 - Save cluster assignments to `outputs/06_cluster_labels.csv`
 - Plot cluster visualization (PCA to 2D) and save to `outputs/06_clusters.png`
+
+---
+
+## Progress Reporting
+After every stage or major task is completed, regenerate `outputs/progress_report.md` in this format (fill in the brackets; keep it concise):
+
+```markdown
+## SkillMap Progress Report
+**Last Updated:** [date and time]
+**Current Stage:** [stage number and name]
+
+### ✅ Completed Stages
+- Stage X — [name]: [one line summary of what was built and key output file]
+
+### 🔄 Current Stage Summary
+**What was built:** [2-3 sentences]
+**Key outputs:** [list of files created]
+**Rows/records processed:** [numbers]
+**Issues found:** [any problems or decisions needed]
+
+### ⏭ Next Stage
+**Stage X — [name]:** [one line on what comes next]
+
+### 📊 Pipeline Health
+| Stage | Status | Output File |
+|---|---|---|
+| Stage 1 — Ingestion | ✅ Complete / ⏳ Pending | outputs/01_summary.txt |
+| ... one row per stage 1-6 ... | | |
+```
 
 ---
 

@@ -1,6 +1,6 @@
 """SkillMap Stage 6 — K-Means and DBSCAN clustering of job postings into role archetypes.
 
-Each job is a multi-hot vector over the 100-skill vocabulary (`matched_skills`, as in
+Each job is a multi-hot vector over the Stage 2 skill vocabulary (`matched_skills`, as in
 Stage 5). Jobs with no matched skill are all-zero vectors, so they are left out of
 clustering and labelled -1 ("No matched skills").
 
@@ -33,7 +33,7 @@ from sklearn.metrics import davies_bouldin_score, silhouette_score
 from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import normalize
 
-from src.preprocessing import find_project_root, load_cleaned_jobs
+from src.preprocessing import FORCED_SKILLS, find_project_root, load_cleaned_jobs
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +59,8 @@ SKILL_THEMES = {
         "medication administration", "patient education", "case management"],
     "Data, Tech & Engineering": [
         "python", "sql", "data analysis", "engineering", "troubleshooting", "research",
-        "quality assurance", "analytical skills", "computer skills"],
+        "quality assurance", "analytical skills", "computer skills", "software development",
+        "computer science", "data management", *FORCED_SKILLS],
     "Sales, Retail & Customer Service": [
         "sales", "marketing", "customer service", "retail", "merchandising", "cash handling",
         "product knowledge", "business development", "negotiation", "relationship building"],
@@ -89,7 +90,7 @@ CATEGORICAL = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300",
 
 
 def load_skill_matrix(project_root: Path) -> tuple:
-    """Load cleaned jobs and return (jobs, multi-hot DataFrame over the 100 vocabulary skills)."""
+    """Load cleaned jobs and return (jobs, multi-hot DataFrame over the vocabulary skills)."""
     jobs = load_cleaned_jobs(project_root / "data" / "processed" / "cleaned_jobs.csv")
     skills = pd.read_csv(project_root / "data" / "processed" / "skill_vocabulary.csv")["skill"].tolist()
     sets = jobs["matched_skills"].map(set)
@@ -397,7 +398,7 @@ def plot_pca(X: np.ndarray, km_labels: np.ndarray, km_names: dict, db_labels: np
     return explained
 
 
-def build_summary(n_jobs: int, n_clustered: int, sweep: pd.DataFrame, best_k: int, kmeans_scores: dict,
+def build_summary(n_jobs: int, n_clustered: int, n_skills: int, sweep: pd.DataFrame, best_k: int, kmeans_scores: dict,
                   dbscan: dict, dbscan_table: pd.DataFrame, comparison: pd.DataFrame, profiles: list,
                   explained: float) -> str:
     """Build the plain-text Stage 6 summary."""
@@ -422,7 +423,7 @@ def build_summary(n_jobs: int, n_clustered: int, sweep: pd.DataFrame, best_k: in
     parts = [
         "SkillMap — Stage 6 Clustering Summary",
         f"Generated: {datetime.now():%Y-%m-%d %H:%M:%S}",
-        f"Vectors: multi-hot over 100 matched_skills. Jobs: {n_jobs:,}; clustered {n_clustered:,} "
+        f"Vectors: multi-hot over {n_skills} matched_skills. Jobs: {n_jobs:,}; clustered {n_clustered:,} "
         f"({n_jobs - n_clustered:,} with no matched skill labelled {NO_SKILLS_LABEL}).",
         f"Silhouette on a fixed random sample of {SILHOUETTE_SAMPLE:,} jobs (DBSCAN: non-noise jobs only).",
         "",
@@ -504,7 +505,7 @@ def run_pipeline(project_root: Path = None) -> dict:
     explained = plot_pca(X, km_fit, names, dbscan["labels"], output_dir / "06_clusters_pca.png")
     comparison = compare_representations(X, best_k)
     kmeans_scores = sweep.loc[sweep["k"] == best_k, ["silhouette", "davies_bouldin"]].iloc[0].to_dict()
-    summary = build_summary(len(jobs), len(X), sweep, best_k, kmeans_scores, dbscan, dbscan_table,
+    summary = build_summary(len(jobs), len(X), X.shape[1], sweep, best_k, kmeans_scores, dbscan, dbscan_table,
                             comparison, profiles, explained)
     (output_dir / "06_summary.txt").write_text(summary, encoding="utf-8")
     logger.info("Saved %s", output_dir / "06_summary.txt")

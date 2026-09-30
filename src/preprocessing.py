@@ -6,8 +6,8 @@ dataset (`data/raw/linkedin_postings/`), plus a cleaned per-job skill list from 
 the salary tiers against the Data Science Salaries dataset.
 
 Postings only carry 35 coarse job-function categories as skills, so the top
-TOP_N_SKILLS skills from the 1.3M dataset are used as a vocabulary and matched
-against each posting's description to produce `matched_skills`.
+TOP_N_SKILLS skills from the 1.3M dataset, plus the technical FORCED_SKILLS, are used as
+a vocabulary and matched against each posting's description to produce `matched_skills`.
 
 Run from the project root with:
     python -m src.preprocessing
@@ -41,7 +41,87 @@ MIN_PLAUSIBLE_SALARY = 10_000
 MAX_PLAUSIBLE_SALARY = 1_000_000
 
 # Size of the skill vocabulary taken from linkedin_jobs_skills for description matching.
-TOP_N_SKILLS = 100
+TOP_N_SKILLS = 200
+
+# Technical skills always added to the vocabulary, whatever their frequency in linkedin_jobs.
+FORCED_SKILLS = [
+    # Languages
+    "python", "sql", "java", "javascript", "r", "scala", "c++", "go", "rust", "kotlin",
+    "swift", "bash", "typescript",
+    # ML / AI
+    "machine learning", "deep learning", "tensorflow", "pytorch", "scikit-learn", "nlp",
+    "computer vision", "llm", "transformers",
+    # Data
+    "spark", "hadoop", "kafka", "airflow", "dbt", "pandas", "numpy", "tableau", "power bi", "looker",
+    # Cloud
+    "aws", "azure", "gcp", "docker", "kubernetes", "terraform", "ci/cd",
+    # Databases
+    "postgresql", "mysql", "mongodb", "redis", "snowflake", "bigquery",
+    # Other
+    "git", "linux", "rest api", "agile", "scrum",
+]
+
+# Extra spellings searched for a skill, on top of the variants found in linkedin_jobs.
+EXTRA_SKILL_FORMS = {
+    "go": ["golang"],
+    "nlp": ["natural language processing"],
+    "llm": ["llms", "large language model", "large language models"],
+    "scikit-learn": ["sklearn"],
+    "power bi": ["powerbi"],
+    "aws": ["amazon web services"],
+    "azure": ["microsoft azure"],
+    "gcp": ["google cloud", "google cloud platform"],
+    "kubernetes": ["k8s"],
+    "ci/cd": ["cicd", "ci cd", "continuous integration"],
+    "postgresql": ["postgres"],
+    "mongodb": ["mongo db"],
+    "bigquery": ["big query"],
+    "git": ["github", "gitlab"],
+    "rest api": ["rest apis", "restful api", "restful apis", "restful services", "restful web services"],
+}
+
+# Skills that are also everyday words ("go", "swift", "spark"), letters ("r"), or other
+# jobs' jargon (electrical "transformers", HVAC "airflow", dialectical behavior therapy
+# "dbt") only count when listed next to, or near, other technical terms.
+_LANGUAGES = (r"(?:python|java|javascript|typescript|c\+\+|c#|ruby|rust|scala|kotlin|swift|sql|sas|"
+              r"stata|matlab|spss|julia|perl|php|bash|golang|node(?:\.js)?)")
+_DATA_STACK = (r"(?:python|sql|scala|spark|hadoop|hive|kafka|airflow|dbt|etl|elt|dags?|snowflake|"
+               r"databricks|redshift|bigquery|looker|big\s*data|data\s*pipelines?|data\s*warehous\w*|"
+               r"data\s*model\w*|analytics\s*engineer\w*|orchestration)")
+_ML_STACK = (r"(?:nlp|natural\s*language|llms?|large\s*language|pytorch|tensorflow|bert|gpt|hugging\s*face|"
+             r"deep\s*learning|machine\s*learning|attention|generative\s*ai|gen\s*ai)")
+
+
+def _listed_with(term: str, peers: str) -> str:
+    """Regex for `term` appearing in a list next to one of `peers` ("python, r", "go / java")."""
+    sep = r"\s*(?:,|/|;|\bor\b|\band\b)\s*"
+    return (rf"(?<![a-z0-9]){peers}{sep}{term}(?![a-z0-9&+#\-])"
+            rf"|(?<![a-z0-9&]){term}{sep}{peers}")
+
+
+def _near(term: str, context: str, window: int = 80) -> str:
+    """Regex for `term` within `window` characters of `context` in the same sentence."""
+    bounded = rf"(?<![a-z0-9]){term}(?![a-z0-9])"
+    context = rf"(?<![a-z0-9]){context}(?![a-z0-9])"
+    return rf"{context}[^.]{{0,{window}}}?{bounded}|{bounded}[^.]{{0,{window}}}?{context}"
+
+
+SKILL_PATTERNS = {
+    "r": _listed_with("r", _LANGUAGES)
+         + r"|(?<![a-z0-9])(?:r\s*programming|r\s*language|r\s*studio|rstudio|r\s*shiny|tidyverse|ggplot2?)(?![a-z0-9])",
+    "go": _listed_with("go", _LANGUAGES) + r"|(?<![a-z0-9])(?:golang|go\s*(?:programming|language|lang))(?![a-z0-9])",
+    "rust": _listed_with("rust", _LANGUAGES)
+            + r"|(?<![a-z0-9])rust\s*(?:programming|language|lang)(?![a-z0-9])"
+            + "|" + _near("rust", r"(?:c\+\+|golang|systems\s*programming|webassembly)"),
+    "swift": _listed_with("swift", _LANGUAGES)
+             + r"|(?<![a-z0-9])(?:swiftui|swift\s*(?:programming|language))(?![a-z0-9])"
+             + "|" + _near("swift", r"(?:ios|xcode|objective[\s\-]*c|cocoa|macos)"),
+    "spark": r"(?<![a-z0-9])(?:apache\s*spark|pyspark|spark\s*(?:sql|streaming))(?![a-z0-9])"
+             + "|" + _near("spark", _DATA_STACK),
+    "airflow": r"(?<![a-z0-9])apache\s*airflow(?![a-z0-9])|" + _near("airflow", _DATA_STACK),
+    "dbt": r"(?<![a-z0-9])(?:data\s*build\s*tool|dbt\s*(?:cloud|core|labs))(?![a-z0-9])|" + _near("dbt", _DATA_STACK),
+    "transformers": r"(?<![a-z0-9])hugging\s*face\s*transformers(?![a-z0-9])|" + _near("transformers?", _ML_STACK),
+}
 
 # Frequent linkedin_jobs "skills" that are benefits or legal boilerplate, not skills.
 # Excluded before taking the top N. Empty this set to keep them.
@@ -51,6 +131,13 @@ EXCLUDED_TERMS = {
     # Mostly match description boilerplate ("medical, dental, vision", "hiring manager",
     # EEO statements) rather than a skill requirement.
     "medical", "vision", "diversity", "hiring",
+    # Benefits and hiring conditions that enter the top 200.
+    "paid holidays", "tuition reimbursement", "employee assistance program", "dental",
+    "weekly pay", "medical benefits", "dental benefits", "vision benefits", "medical insurance",
+    "401(k) plan", "401k retirement plan", "disability insurance", "referral bonus",
+    "flexible schedule", "background check", "diversity and inclusion", "inclusion",
+    # Everyday words that match far more often than the Microsoft product they stand for.
+    "word", "outlook",
 }
 
 # Near-duplicate skills merged into one canonical skill (variant -> canonical).
@@ -287,7 +374,12 @@ def build_skill_vocabulary(jobs_skills: pd.DataFrame, top_n: int = TOP_N_SKILLS)
     Skills in EXCLUDED_TERMS are removed. Each skill is named after its most frequent
     form, and job counts are summed across its variants.
 
-    Columns: skill, job_count, n_variants, forms (the spellings searched for in text).
+    FORCED_SKILLS are then added (see add_forced_skills), so the vocabulary can hold more
+    than `top_n` skills.
+
+    Columns: skill, job_count, n_variants, forms (the spellings searched for in text),
+    forced (True for FORCED_SKILLS), pattern (the regex searched for; SKILL_PATTERNS
+    overrides the one built from forms).
     """
     counts = jobs_skills["skills_list"].explode().value_counts()
     variants = counts.rename("job_count").rename_axis("raw").reset_index()
@@ -311,10 +403,42 @@ def build_skill_vocabulary(jobs_skills: pd.DataFrame, top_n: int = TOP_N_SKILLS)
              .agg(skill=("form", "first"), job_count=("job_count", "sum"), n_variants=("form", "size"))
              .join(forms[forms["searched"]].groupby("group")["form"].agg(list).rename("forms")))
     vocab["skill"] = [canonical.get(g, name) for g, name in zip(vocab.index, vocab["skill"])]
-    vocab = vocab.sort_values("job_count", ascending=False).head(top_n).reset_index(drop=True)
-    logger.info("Built skill vocabulary: top %d of %d distinct raw skills (%d terms excluded)",
-                len(vocab), len(counts), len(EXCLUDED_TERMS))
-    return vocab
+    vocab = vocab.sort_values("job_count", ascending=False)
+    vocab["forced"] = False
+    vocab = add_forced_skills(vocab.head(top_n), vocab)
+    vocab["pattern"] = [SKILL_PATTERNS.get(row.skill) or skill_pattern(row.forms) for row in vocab.itertuples()]
+    logger.info("Built skill vocabulary: top %d of %d distinct raw skills + %d forced (%d terms excluded)",
+                min(top_n, len(vocab)), len(counts), int(vocab["forced"].sum()), len(EXCLUDED_TERMS))
+    return vocab.reset_index(drop=True)
+
+
+def add_forced_skills(top: pd.DataFrame, all_skills: pd.DataFrame) -> pd.DataFrame:
+    """Append the FORCED_SKILLS missing from `top` and give every forced skill its canonical name and forms.
+
+    `all_skills` is the full frequency-sorted vocabulary indexed by group key, so a forced
+    skill keeps its linkedin_jobs job count and spelling variants when it has any. Forced
+    skills never listed in linkedin_jobs get a job count of 0. Appended skills are sorted by
+    job count after the top skills.
+    """
+    top = top.copy()
+    extra = []
+    for skill in FORCED_SKILLS:
+        key = skill_key(skill)
+        source = top if key in top.index else all_skills
+        if key in source.index:
+            row = source.loc[key].copy()
+        else:
+            row = pd.Series({"job_count": 0, "n_variants": 0, "forms": np.nan})
+        forms = row["forms"] if isinstance(row["forms"], list) else []
+        forms = list(dict.fromkeys([skill, *forms, *EXTRA_SKILL_FORMS.get(skill, [])]))
+        if key in top.index:
+            top.at[key, "skill"], top.at[key, "forms"], top.at[key, "forced"] = skill, forms, True
+        else:
+            row["skill"], row["forms"], row["forced"] = skill, forms, True
+            extra.append(row.rename(key))
+    extra = pd.DataFrame(extra).sort_values("job_count", ascending=False)
+    extra = extra.astype({"job_count": int, "n_variants": int, "forced": bool})
+    return pd.concat([top, extra])
 
 
 def skill_pattern(forms: list) -> str:
@@ -341,7 +465,7 @@ def match_description_skills(df: pd.DataFrame, vocab: pd.DataFrame) -> pd.Series
     Skills are listed in vocabulary order (most common first).
     """
     text = (df["description"].fillna("") + " " + df["skills_desc"].fillna("")).str.lower()
-    patterns = {row.skill: skill_pattern(row.forms) for row in vocab.itertuples()}
+    patterns = dict(zip(vocab["skill"], vocab["pattern"]))
     forms = dict(zip(vocab["skill"], vocab["forms"]))
     containers = [skill for skill in patterns
                   if any(other != skill and re.search(patterns[other], form)
@@ -485,10 +609,16 @@ def build_summary(cleaned: pd.DataFrame, jobs_skills: pd.DataFrame, vocab: pd.Da
         f"Mean skills per job: {cleaned['skills_list'].str.len().mean():.2f}",
         skill_counts.head(15).to_string(),
         "",
-        f"-- Matched skills (top {len(vocab)} linkedin_jobs skills found in descriptions) --",
+        f"-- Matched skills ({len(vocab)} skills found in descriptions: top {TOP_N_SKILLS} linkedin_jobs "
+        f"skills + {int(vocab['forced'].sum())} forced technical skills, "
+        f"{int(vocab['forced'].iloc[TOP_N_SKILLS:].sum())} of them beyond the top {TOP_N_SKILLS}) --",
         f"Jobs with >= 1 matched skill: {int((cleaned['matched_skills'].str.len() > 0).sum()):,} "
         f"of {len(cleaned):,}",
         f"Mean matched skills per job: {cleaned['matched_skills'].str.len().mean():.1f}",
+        f"Jobs with >= 1 forced technical skill: "
+        f"{int(cleaned['matched_skills'].map(lambda s: bool(set(s) & set(FORCED_SKILLS))).sum()):,}",
+        "Forced technical skills by job count:",
+        matched_counts.reindex(FORCED_SKILLS).fillna(0).astype(int).sort_values(ascending=False).to_string(),
         f"Vocabulary skills never matched: {unmatched if unmatched else 'none'}",
         f"Excluded non-skill terms: {sorted(EXCLUDED_TERMS)}",
         f"Synonyms merged: {SKILL_SYNONYMS}",

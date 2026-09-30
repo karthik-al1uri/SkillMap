@@ -1,7 +1,7 @@
 """SkillMap Stage 5 — salary tier classification (Logistic Regression, Random Forest, XGBoost).
 
 Predicts `salary_tier` (Low / Mid / High) from posting features:
-    - matched_skills: multi-hot over the 100-skill vocabulary
+    - matched_skills: multi-hot over the Stage 2 skill vocabulary
     - experience_level: ordinal (Internship 0 ... Executive 5, Unknown -1)
     - company_size: ordinal bucket of the company's employee_count (from the warehouse)
     - state: one-hot of the top 20 states, everything else (incl. no state) = Other
@@ -106,7 +106,7 @@ def load_model_data(project_root: Path) -> pd.DataFrame:
 
 
 def load_skill_vocabulary(project_root: Path) -> list:
-    """Return the 100 vocabulary skills (from Stage 2) that define the skill feature columns."""
+    """Return the vocabulary skills (from Stage 2) that define the skill feature columns."""
     return pd.read_csv(project_root / "data" / "processed" / "skill_vocabulary.csv")["skill"].tolist()
 
 

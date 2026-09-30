@@ -107,13 +107,13 @@ Local environment: Homebrew Python blocks `pip install` (PEP 668), so the projec
 - Save a merged exploration summary to `outputs/01_summary.txt`
 
 ### Stage 2 — Data Preprocessing (`notebooks/02_preprocessing.ipynb`, `src/preprocessing.py`)
-**Status: complete.** Run with `python -m src.preprocessing` (~3 min).
+**Status: complete.** Run with `python -m src.preprocessing` (~8 min).
 - Main table: `linkedin_postings/postings.csv`, joined with `jobs/salaries.csv`, `jobs/job_skills.csv` + `mappings/skills.csv`, and `jobs/job_industries.csv` + `mappings/industries.csv`
 - Normalize job titles to lowercase and strip whitespace
 - Salary: `normalized_salary` is primary (pay_period annualized: hourly x2080, weekly x52, biweekly x26, monthly x12). Drop rows with no salary, non-USD rows, and salaries outside $10k-$1M. Impute remaining gaps by `experience_level` median
 - Drop reposted duplicate ads (same company_name, title, description, normalized_salary; 1,425 rows). Without this, copies land on both sides of Stage 5's split and inflate scores
 - Discretize salary into three tiers at the 33rd/66th percentiles: Low (<= $62,400), Mid (<= $109,200), High
-- `skills_list` = 35 coarse job-function categories. `matched_skills` = concrete skills: the top 100 skills from `linkedin_jobs/job_skills.csv` (spelling variants and `SKILL_SYNONYMS` merged, `EXCLUDED_TERMS` removed), regex-matched in each posting's description. Phrases containing another skill ("project management" ⊃ "management") are matched first and blanked out of the text, so there are no tautological rules. **Stages 4-6 should use `matched_skills`**
+- `skills_list` = 35 coarse job-function categories. `matched_skills` = concrete skills: 245 skills = the top 200 (`TOP_N_SKILLS`) from `linkedin_jobs/job_skills.csv` (spelling variants and `SKILL_SYNONYMS` merged, `EXCLUDED_TERMS` benefits/boilerplate removed) + 50 technical `FORCED_SKILLS` (45 beyond the top 200), regex-matched in each posting's description. Phrases containing another skill ("project management" ⊃ "management") are matched first and blanked out of the text, so there are no tautological rules. Ambiguous technical terms (r, go, rust, swift, spark, airflow, dbt, transformers) use context regexes in `SKILL_PATTERNS`. Mean 11.5 skills per job; 99.3% of jobs have ≥ 1; 14.8% have ≥ 1 forced technical skill. **Stages 4-6 should use `matched_skills`**
 - Outputs:
   - `data/processed/cleaned_jobs.csv` (34,179 rows): job_id, job_title, company_name, location, experience_level, industry, skills_list, matched_skills, normalized_salary, salary_tier. Read it with `src.preprocessing.load_cleaned_jobs()` so the list columns are parsed
   - `data/processed/linkedin_jobs_skills.csv` (1.29M job_link → skills_list)
@@ -121,10 +121,10 @@ Local environment: Homebrew Python blocks `pip install` (PEP 668), so the projec
   - `outputs/02_summary.txt`
 
 ### Stage 3 — Data Warehousing (`notebooks/03_data_warehouse.ipynb`, `src/warehouse.py`)
-**Status: complete.** Run with `python -m src.warehouse` (~5 s). Output: `data/processed/skillmap.db` (SQLite, ~50 MB) and `outputs/03_summary.txt`.
-- Fact table `job_postings` at (job, skill) grain: job_id, skill_id, location_id, company_id, time_id, salary_tier, experience_level, normalized_salary (337,421 rows). Jobs with no skills get one row with skill_id NULL
+**Status: complete.** Run with `python -m src.warehouse` (~5 s). Output: `data/processed/skillmap.db` (SQLite, ~63 MB) and `outputs/03_summary.txt`.
+- Fact table `job_postings` at (job, skill) grain: job_id, skill_id, location_id, company_id, time_id, salary_tier, experience_level, normalized_salary (449,665 rows). Jobs with no skills get one row with skill_id NULL
 - Dimensions:
-  - `dim_skills`: skill_type 'extracted' = 100 matched_skills, 'category' = 35 LinkedIn categories
+  - `dim_skills`: skill_type 'extracted' = 245 matched_skills, 'category' = 35 LinkedIn categories
   - `dim_location`: city/state/location_type parsed from the raw string
   - `dim_company`: company_size 0-7, latest employee_count; company_id 0 = Unknown
   - `dim_time`: time_id YYYYMMDD, from original_listed_time
@@ -143,8 +143,8 @@ Local environment: Homebrew Python blocks `pip install` (PEP 668), so the projec
 - Plot top skill co-occurrence network and save to `outputs/04_skill_network.png`
 
 **Status: complete.** Run with `python -m src.association` (~2 s). Transactions = `matched_skills`.
-- All jobs: 241 frequent itemsets, 35 rules pass the filters, graph has 33 skills / 138 edges. The plot draws edges with lift >= 1.2 (`PLOT_MIN_LIFT`)
-- High-tier jobs only: 121 rules → `outputs/04_high_salary_rules.csv`. Each rule has `jobs_with_itemset`, `high_tier_rate`, and `high_tier_lift` (High share among ALL jobs with the itemset ÷ 33.3% baseline), which shows whether a combination actually predicts High pay
+- All jobs: 343 frequent itemsets, 91 rules pass the filters, graph has 40 skills / 191 edges. The plot draws edges with lift >= 1.2 (`PLOT_MIN_LIFT`)
+- High-tier jobs only: 277 rules → `outputs/04_high_salary_rules.csv`. Each rule has `jobs_with_itemset`, `high_tier_rate`, and `high_tier_lift` (High share among ALL jobs with the itemset ÷ 33.3% baseline), which shows whether a combination actually predicts High pay
 - Summary: `outputs/04_summary.txt`
 
 ### Stage 5 — Classification (`notebooks/05_classification.ipynb`, `src/classification.py`)
@@ -162,8 +162,8 @@ Local environment: Homebrew Python blocks `pip install` (PEP 668), so the projec
 - Save best model to `outputs/05_best_model.pkl`
 - Save results comparison to `outputs/05_classification_results.csv`
 
-**Status: complete.** Run with `python -m src.classification` (~5 s). Features as specified by the user (multi-hot skills rather than TF-IDF):
-- `matched_skills` multi-hot (100 columns)
+**Status: complete.** Run with `python -m src.classification` (~2.5 min, mostly the Model 4 grid search). Features as specified by the user (multi-hot skills rather than TF-IDF):
+- `matched_skills` multi-hot (245 columns)
 - experience_level ordinal: Internship 0, Entry 1, Associate 2, Mid-Senior 3, Director 4, Executive 5, Unknown −1
 - company_size ordinal 0-8 binned from warehouse `employee_count`
 - top 20 states one-hot + Other
@@ -172,11 +172,11 @@ Local environment: Homebrew Python blocks `pip install` (PEP 668), so the projec
 Top states and industries are chosen on the train split only.
 - Model 4 `XGBoost + title TF-IDF` = base features + TF-IDF of the top 50 job-title words (stop words removed, fit on train). Hyperparameters come from a 3-fold CV grid search on train only (~2.5 min); best was 600 trees, depth 8, lr 0.1, colsample 1.0
 - Results (test):
-  - XGBoost + title TF-IDF: F1 0.719 / AUC 0.884 (**best, saved**)
-  - Random Forest: 0.690 / 0.862
-  - XGBoost: 0.667 / 0.847
-  - LR: 0.612 / 0.801
-- **F1 > 0.75 target not met by any model; AUC target met by all.** Exploration: 2,000 title 1-2 grams reached ~0.74, still short. Errors are almost all at the Mid-tier boundary
+  - XGBoost + title TF-IDF: F1 0.731 / AUC 0.891 (**best, saved**)
+  - Random Forest: 0.707 / 0.872
+  - XGBoost: 0.679 / 0.857
+  - LR: 0.632 / 0.815
+- **F1 > 0.75 target not met by any model; AUC target met by all.** The 245-skill vocabulary added ~0.01-0.02 F1 to every model. Exploration: 2,000 title 1-2 grams reached ~0.74, still short. Errors are almost all at the Mid-tier boundary
 - Outputs: `05_classification_results.csv`, `05_best_model.pkl` (dict with model + feature metadata), `05_confusion_matrix.png`, `05_feature_importance.png`, `05_summary.txt`
 
 ### Stage 6 — Clustering (`notebooks/06_clustering.ipynb`, `src/clustering.py`)
@@ -190,18 +190,18 @@ Top states and industries are chosen on the train split only.
 - Save cluster assignments to `outputs/06_cluster_labels.csv`
 - Plot cluster visualization (PCA to 2D) and save to `outputs/06_clusters.png`
 
-**Status: complete.** Run with `python -m src.clustering` (~30 s). As requested by the user, the actual setup uses multi-hot `matched_skills` (not TF-IDF), K-Means k = 3-10 chosen by silhouette, and DBSCAN min_samples = 20.
+**Status: complete.** Run with `python -m src.clustering` (~1 min). As requested by the user, the actual setup uses multi-hot `matched_skills` (not TF-IDF), K-Means k = 3-10 chosen by silhouette, and DBSCAN min_samples = 20.
 - **DBSCAN eps:** candidates are the √n steps of the k-distance staircase (10th-90th percentile). The pick is the best silhouette with ≥ 2 clusters and ≤ 50% noise
-- **Jobs with no matched skills:** 504, labelled −1
+- **Jobs with no matched skills:** 255, labelled −1
 - **Results:** targets **not met**
-  - K-Means k = 3: silhouette 0.03, DB 4.19. No elbow; silhouette < 0.04 for every k
-  - DBSCAN eps = 2.45: 2 clusters (99.9% in one), 14.7% noise, silhouette 0.17, DB 1.04
+  - K-Means k = 3: silhouette 0.06, DB 4.72. No elbow; silhouette < 0.06 for every k
+  - DBSCAN eps = 2.83: 2 clusters (99.8% in one), 31.8% noise, silhouette 0.21, DB 0.93 (DB target met)
   - TF-IDF → SVD(10) sensitivity check: silhouette 0.14
   - Conclusion: skill profiles form a continuum
 - **Clusters (named via `SKILL_THEMES`; lift > 1 defines skills):**
-  - Management & Leadership (28%, mean $114k)
-  - Education & Training (27%, mean $80k)
-  - Generalist (few listed skills) (44%, mean $95k)
+  - Data, Tech & Engineering (17%, mean $132k, 64% High)
+  - Management & Leadership (31%, mean $101k)
+  - Sales, Retail & Customer Service (51%, mean $82k)
 - **Outputs:** `06_cluster_labels.csv`, `06_elbow_plot.png`, `06_kdistance_plot.png`, `06_clusters_pca.png`, `06_cluster_profiles.txt`, `06_summary.txt`
 
 ---

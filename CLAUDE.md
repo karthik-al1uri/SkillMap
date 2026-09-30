@@ -168,15 +168,16 @@ Local environment: Homebrew Python blocks `pip install` (PEP 668), so the projec
 - company_size ordinal 0-8 binned from warehouse `employee_count`
 - top 20 states one-hot + Other
 - top 15 industries multi-hot + Other
+- n_matched_skills (count). A `salary_per_skill` feature was rejected: it is computed from the target (leakage)
 
 Top states and industries are chosen on the train split only.
-- Model 4 `XGBoost + title TF-IDF` = base features + TF-IDF of the top 50 job-title words (stop words removed, fit on train). Hyperparameters come from a 3-fold CV grid search on train only (~2.5 min); best was 600 trees, depth 8, lr 0.1, colsample 1.0
+- Model 4 `XGBoost + title & company TF-IDF` = base features + TF-IDF of the top 50 job-title words and top 30 company-name words (stop words and legal suffixes removed, fit on train). Hyperparameters come from a 3-fold CV grid search on train only (max_depth 4/6/8 × n_estimators 200/400 × lr 0.05/0.1 × subsample 0.8/1.0, ~2.5 min); best was 400 trees, depth 8, lr 0.1, subsample 0.8
 - Results (test):
-  - XGBoost + title TF-IDF: F1 0.731 / AUC 0.891 (**best, saved**)
-  - Random Forest: 0.707 / 0.872
-  - XGBoost: 0.679 / 0.857
+  - XGBoost + title & company TF-IDF: F1 0.728 / AUC 0.891 (**best, saved**)
+  - Random Forest: 0.703 / 0.873
+  - XGBoost: 0.683 / 0.858
   - LR: 0.632 / 0.815
-- **F1 > 0.75 target not met by any model; AUC target met by all.** The 245-skill vocabulary added ~0.01-0.02 F1 to every model. Exploration: 2,000 title 1-2 grams reached ~0.74, still short. Errors are almost all at the Mid-tier boundary
+- **F1 > 0.75 target not met by any model; AUC target met by all.** The 245-skill vocabulary added ~0.01-0.02 F1 to every model; company TF-IDF added nothing (title-only with 600 trees scored 0.731). Exploration: 2,000 title 1-2 grams reached ~0.74, still short. Errors are almost all at the Mid-tier boundary
 - Outputs: `05_classification_results.csv`, `05_best_model.pkl` (dict with model + feature metadata), `05_confusion_matrix.png`, `05_feature_importance.png`, `05_summary.txt`
 
 ### Stage 6 — Clustering (`notebooks/06_clustering.ipynb`, `src/clustering.py`)
@@ -203,6 +204,11 @@ Top states and industries are chosen on the train split only.
   - Management & Leadership (31%, mean $101k)
   - Sales, Retail & Customer Service (51%, mean $82k)
 - **Outputs:** `06_cluster_labels.csv`, `06_elbow_plot.png`, `06_kdistance_plot.png`, `06_clusters_pca.png`, `06_cluster_profiles.txt`, `06_summary.txt`
+
+---
+
+### Final Report
+**Status: complete.** `outputs/final_report.md`: paper-style write-up (abstract, dataset, methodology, Q1-Q3 results, discussion, conclusion, IEEE references). The references are 7 standard method papers because the proposal isn't in the repo; swap them in if they differ.
 
 ---
 

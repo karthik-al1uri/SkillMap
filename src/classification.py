@@ -6,11 +6,14 @@ Predicts `salary_tier` (Low / Mid / High) from posting features:
     - company_size: ordinal bucket of the company's employee_count (from the warehouse)
     - state: one-hot of the top 20 states, everything else (incl. no state) = Other
     - industry: multi-hot of the top 15 industries plus an Other flag (jobs have up to 3)
+    - n_matched_skills: number of matched skills in the posting
 
 Top states and industries are chosen from the training split only.
 
-Model 4 (XGBoost + title TF-IDF) adds TF-IDF weights of the TITLE_TFIDF_MAX_FEATURES
-most frequent job-title words (English stop words removed, fit on the training split).
+Model 4 (XGBoost + title & company TF-IDF) adds TF-IDF weights of the
+TITLE_TFIDF_MAX_FEATURES most frequent job-title words and the COMPANY_TFIDF_MAX_FEATURES
+most frequent company-name words (English stop words and legal suffixes such as "inc"
+removed; both fit on the training split).
 Its hyperparameters are chosen by 3-fold cross-validated grid search on the training
 split only, so the test set is never used for tuning.
 
@@ -50,13 +53,17 @@ TEST_SIZE = 0.2
 TOP_N_STATES = 20
 TOP_N_INDUSTRIES = 15
 TITLE_TFIDF_MAX_FEATURES = 50
-TITLE_MODEL_NAME = "XGBoost + title TF-IDF"
+COMPANY_TFIDF_MAX_FEATURES = 30
+# Company-name words that say nothing about the employer.
+COMPANY_STOP_WORDS = ["inc", "llc", "corp", "corporation", "co", "company", "ltd", "lp", "llp",
+                      "pc", "pllc", "plc", "na", "usa", "us"]
+TITLE_MODEL_NAME = "XGBoost + title & company TF-IDF"
 # Grid searched for Model 4 with 3-fold CV (macro F1) on the training split.
 TITLE_MODEL_GRID = {
-    "n_estimators": [300, 600],
-    "max_depth": [6, 8],
+    "max_depth": [4, 6, 8],
+    "n_estimators": [200, 400],
     "learning_rate": [0.05, 0.1],
-    "colsample_bytree": [0.5, 1.0],
+    "subsample": [0.8, 1.0],
 }
 F1_TARGET = 0.75
 AUC_TARGET = 0.80
@@ -149,24 +156,36 @@ def build_features(df: pd.DataFrame, skills: list, top: dict) -> pd.DataFrame:
         features[f"industry_{ind}"] = industries.map(lambda xs, k=ind: k in xs).astype(int)
     features["industry_Other"] = industries.map(
         lambda xs: not xs or any(x not in top["industries"] for x in xs)).astype(int)
+    features["n_matched_skills"] = df["matched_skills"].str.len()
     return pd.DataFrame(features, index=df.index)
 
 
-def build_title_features(train_titles: pd.Series, test_titles: pd.Series,
-                         X_train: pd.DataFrame, X_test: pd.DataFrame) -> tuple:
-    """Append job-title TF-IDF columns to the base features.
+def build_text_features(train_df: pd.DataFrame, test_df: pd.DataFrame,
+                        X_train: pd.DataFrame, X_test: pd.DataFrame) -> tuple:
+    """Append job-title and company-name TF-IDF columns to the base features.
 
-    The vectorizer keeps the TITLE_TFIDF_MAX_FEATURES most frequent title words (English
-    stop words removed) and is fit on training titles only. Returns sparse train/test
-    matrices, the combined feature names, and the fitted vectorizer.
+    Keeps the TITLE_TFIDF_MAX_FEATURES most frequent title words and the
+    COMPANY_TFIDF_MAX_FEATURES most frequent company-name words (English stop words and
+    COMPANY_STOP_WORDS removed). Both vectorizers are fit on the training split only.
+    Returns sparse train/test matrices, the combined feature names, and the fitted
+    vectorizers keyed by column.
     """
-    vectorizer = TfidfVectorizer(max_features=TITLE_TFIDF_MAX_FEATURES, stop_words="english")
-    title_train = vectorizer.fit_transform(train_titles)
-    title_test = vectorizer.transform(test_titles)
-    A_train = sp.hstack([sp.csr_matrix(X_train.to_numpy(dtype=float)), title_train]).tocsr()
-    A_test = sp.hstack([sp.csr_matrix(X_test.to_numpy(dtype=float)), title_test]).tocsr()
-    names = [*X_train.columns, *[f"title_{w}" for w in vectorizer.get_feature_names_out()]]
-    return A_train, A_test, names, vectorizer
+    english = list(TfidfVectorizer(stop_words="english").get_stop_words())
+    vectorizers = {
+        "job_title": ("title", TfidfVectorizer(max_features=TITLE_TFIDF_MAX_FEATURES, stop_words="english")),
+        "company_name": ("company", TfidfVectorizer(max_features=COMPANY_TFIDF_MAX_FEATURES,
+                                                    stop_words=english + COMPANY_STOP_WORDS)),
+    }
+    train_parts = [sp.csr_matrix(X_train.to_numpy(dtype=float))]
+    test_parts = [sp.csr_matrix(X_test.to_numpy(dtype=float))]
+    names = list(X_train.columns)
+    for column, (prefix, vectorizer) in vectorizers.items():
+        train_parts.append(vectorizer.fit_transform(train_df[column].fillna("")))
+        test_parts.append(vectorizer.transform(test_df[column].fillna("")))
+        names += [f"{prefix}_{w}" for w in vectorizer.get_feature_names_out()]
+    A_train = sp.hstack(train_parts).tocsr()
+    A_test = sp.hstack(test_parts).tocsr()
+    return A_train, A_test, names, {column: v for column, (_, v) in vectorizers.items()}
 
 
 def tune_title_model(A_train, y_train) -> tuple:
@@ -175,7 +194,7 @@ def tune_title_model(A_train, y_train) -> tuple:
     Returns the refit best estimator and a dict with the best params and CV macro F1.
     """
     search = GridSearchCV(
-        XGBClassifier(subsample=0.9, objective="multi:softprob", eval_metric="mlogloss",
+        XGBClassifier(objective="multi:softprob", eval_metric="mlogloss",
                       random_state=RANDOM_STATE, n_jobs=-1),
         TITLE_MODEL_GRID, scoring="f1_macro",
         cv=StratifiedKFold(n_splits=3, shuffle=True, random_state=RANDOM_STATE))
@@ -224,7 +243,7 @@ def train_and_evaluate(X_train, y_train, X_test, y_test) -> tuple:
 
 
 def train_title_model(A_train, y_train, A_test, y_test) -> tuple:
-    """Tune, fit, and evaluate Model 4 on base + title TF-IDF features.
+    """Tune, fit, and evaluate Model 4 on base + title and company TF-IDF features.
 
     Returns (fitted model, metrics, tuning info).
     """
@@ -238,7 +257,7 @@ def train_title_model(A_train, y_train, A_test, y_test) -> tuple:
 def results_table(metrics: dict) -> pd.DataFrame:
     """Return one row per model with the headline metrics, best F1 first."""
     rows = [{"model": name,
-             "features": "base + title TF-IDF" if name == TITLE_MODEL_NAME else "base",
+             "features": "base + title & company TF-IDF" if name == TITLE_MODEL_NAME else "base",
              "f1_macro": m["f1_macro"],
              "roc_auc_ovr": m["roc_auc_ovr"],
              "accuracy": m["accuracy"],
@@ -269,7 +288,7 @@ def feature_importance(model, feature_names: list) -> pd.Series:
 def pretty_feature(name: str) -> str:
     """Turn a feature column name into a readable axis label."""
     for prefix, label in [("skill_", "skill"), ("state_", "state"), ("industry_", "industry"),
-                          ("title_", "title word")]:
+                          ("title_", "title word"), ("company_", "company word")]:
         if name.startswith(prefix):
             return f"{label}: {name[len(prefix):]}"
     return name.replace("_", " ")
@@ -339,10 +358,11 @@ def plot_confusion_matrices(metrics: dict, path: Path) -> None:
 
 
 def save_best_model(model, name: str, feature_names: list, top: dict, skills: list, path: Path,
-                    title_vectorizer: TfidfVectorizer = None) -> None:
+                    text_vectorizers: dict = None) -> None:
     """Pickle the best model with everything needed to rebuild its features.
 
-    `title_vectorizer` is included when the best model uses title TF-IDF features.
+    `text_vectorizers` ({column: fitted TfidfVectorizer}) is included when the best model
+    uses the title and company TF-IDF features.
     """
     bundle = {
         "model_name": name,
@@ -354,7 +374,7 @@ def save_best_model(model, name: str, feature_names: list, top: dict, skills: li
         "company_size_bins": COMPANY_SIZE_BINS,
         "tier_labels": TIER_LABELS,
         "random_state": RANDOM_STATE,
-        "title_vectorizer": title_vectorizer,
+        "text_vectorizers": text_vectorizers,
     }
     with open(path, "wb") as f:
         pickle.dump(bundle, f)
@@ -363,7 +383,7 @@ def save_best_model(model, name: str, feature_names: list, top: dict, skills: li
 
 def build_summary(df: pd.DataFrame, X: pd.DataFrame, n_train: int, n_test: int, top: dict,
                   table: pd.DataFrame, metrics: dict, best: str, importances: pd.Series,
-                  title_words: list = None, tuning: dict = None) -> str:
+                  text_words: dict = None, tuning: dict = None) -> str:
     """Build the plain-text Stage 5 summary."""
     line = "=" * 80
     best_row = table.iloc[0]
@@ -384,9 +404,14 @@ def build_summary(df: pd.DataFrame, X: pd.DataFrame, n_train: int, n_test: int, 
         size_counts.to_string(),
         f"state one-hot, top {TOP_N_STATES} + Other (Other includes jobs with no state): {top['states']}",
         f"industry multi-hot, top {TOP_N_INDUSTRIES} + Other: {top['industries']}",
-        *([f"Model 4 adds title TF-IDF, top {len(title_words)} words (stop words removed): {title_words}",
+        f"n_matched_skills: count of matched skills per job",
+        *([f"Model 4 adds title TF-IDF, top {len(text_words['job_title'])} words (stop words removed): "
+           f"{text_words['job_title']}",
+           f"Model 4 adds company-name TF-IDF, top {len(text_words['company_name'])} words "
+           f"(stop words and {COMPANY_STOP_WORDS} removed): {text_words['company_name']}",
+           f"Model 4 grid: {TITLE_MODEL_GRID}",
            f"Model 4 hyperparameters (3-fold CV on train, macro F1 {tuning['cv_f1_macro']:.3f}): "
-           f"{tuning['best_params']}"] if title_words else []),
+           f"{tuning['best_params']}"] if text_words else []),
         "",
         f"{line}\nResults (test set)\n{line}",
         table.to_string(index=False),
@@ -427,32 +452,31 @@ def run_pipeline(project_root: Path = None) -> dict:
     logger.info("Features: %d columns; train %d, test %d", X_train.shape[1], len(X_train), len(X_test))
 
     models, metrics = train_and_evaluate(X_train, y_train, X_test, y_test)
-    A_train, A_test, title_names, vectorizer = build_title_features(
-        train_df["job_title"], test_df["job_title"], X_train, X_test)
+    A_train, A_test, text_names, vectorizers = build_text_features(train_df, test_df, X_train, X_test)
     models[TITLE_MODEL_NAME], metrics[TITLE_MODEL_NAME], tuning = train_title_model(
         A_train, y_train, A_test, y_test)
 
     table = results_table(metrics)
     table.to_csv(output_dir / "05_classification_results.csv", index=False)
     best = table.iloc[0]["model"]
-    uses_title = best == TITLE_MODEL_NAME
-    feature_names = title_names if uses_title else list(X_train.columns)
+    uses_text = best == TITLE_MODEL_NAME
+    feature_names = text_names if uses_text else list(X_train.columns)
 
     importances = feature_importance(models[best], feature_names)
     plot_feature_importance(importances, best, output_dir / "05_feature_importance.png")
     plot_confusion_matrices(metrics, output_dir / "05_confusion_matrix.png")
     save_best_model(models[best], best, feature_names, top, skills, output_dir / "05_best_model.pkl",
-                    title_vectorizer=vectorizer if uses_title else None)
+                    text_vectorizers=vectorizers if uses_text else None)
 
-    title_words = list(vectorizer.get_feature_names_out())
+    text_words = {column: list(v.get_feature_names_out()) for column, v in vectorizers.items()}
     summary = build_summary(df, X_train, len(X_train), len(X_test), top, table, metrics, best, importances,
-                            title_words=title_words, tuning=tuning)
+                            text_words=text_words, tuning=tuning)
     (output_dir / "05_summary.txt").write_text(summary, encoding="utf-8")
     logger.info("Saved %s", output_dir / "05_summary.txt")
     return {"models": models, "metrics": metrics, "table": table, "best": best,
             "importances": importances, "X_train": X_train, "X_test": X_test,
             "y_train": y_train, "y_test": y_test, "top": top, "summary": summary,
-            "A_train": A_train, "A_test": A_test, "title_vectorizer": vectorizer, "tuning": tuning}
+            "A_train": A_train, "A_test": A_test, "text_vectorizers": vectorizers, "tuning": tuning}
 
 
 if __name__ == "__main__":

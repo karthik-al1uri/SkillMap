@@ -4,6 +4,7 @@ data/processed/
 outputs/*
 !outputs/.gitkeep
 !outputs/progress_report.md
+!outputs/final_report.md
 *.csv
 *.json
 

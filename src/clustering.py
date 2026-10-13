@@ -12,6 +12,11 @@ with <= DBSCAN_MAX_NOISE noise and the highest silhouette.
 Both are scored with silhouette (target > 0.50) and Davies-Bouldin (target < 1.0). Silhouette is computed on a fixed random sample of
 SILHOUETTE_SAMPLE jobs, because the exact score is O(n^2).
 
+Outlier detection: an Isolation Forest on matched_skills multi-hot + experience_level ordinal +
+normalized_salary flags the OUTLIER_CONTAMINATION most anomalous postings. To test whether they
+are salary mismatches (high pay for a low-skill profile or the reverse), each job's log salary is
+z-scored within its (K-Means cluster, experience_level) group.
+
 Run from the project root with:
     python -m src.clustering
 """
@@ -28,11 +33,13 @@ import numpy as np
 import pandas as pd
 from sklearn.cluster import DBSCAN, KMeans
 from sklearn.decomposition import PCA, TruncatedSVD
+from sklearn.ensemble import IsolationForest
 from sklearn.feature_extraction.text import TfidfTransformer
 from sklearn.metrics import davies_bouldin_score, silhouette_score
 from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import normalize
 
+from src.classification import EXPERIENCE_TO_CODE
 from src.preprocessing import FORCED_SKILLS, find_project_root, load_cleaned_jobs
 
 logger = logging.getLogger(__name__)
@@ -51,6 +58,10 @@ GENERALIST_NAME = "Generalist (few listed skills)"
 NO_SKILLS_LABEL = -1
 NO_SKILLS_NAME = "No matched skills"
 TIER_LABELS = ["Low", "Mid", "High"]
+OUTLIER_CONTAMINATION = 0.01  # flag the top 1% most anomalous postings
+OUTLIER_N_ESTIMATORS = 300
+MISMATCH_Z = 2.0              # |z| of log salary within (cluster, experience) above this = salary mismatch
+OUTLIER_SVD_COMPONENTS = 10   # sensitivity run: skills compressed so salary carries more weight
 
 # Skill -> theme used to name clusters from their defining skills.
 SKILL_THEMES = {
@@ -398,10 +409,139 @@ def plot_pca(X: np.ndarray, km_labels: np.ndarray, km_names: dict, db_labels: np
     return explained
 
 
+def outlier_features(jobs: pd.DataFrame, matrix: pd.DataFrame) -> pd.DataFrame:
+    """Return the Isolation Forest inputs: skill multi-hot, experience_level ordinal, normalized_salary.
+
+    No scaling is needed: Isolation Forest picks split points uniformly between each feature's
+    min and max, so it is invariant to per-feature scale.
+    """
+    features = matrix.copy()
+    features["experience_level"] = jobs["experience_level"].map(EXPERIENCE_TO_CODE).fillna(-1).astype(int)
+    features["normalized_salary"] = jobs["normalized_salary"]
+    return features
+
+
+def detect_outliers(features: pd.DataFrame, contamination: float = OUTLIER_CONTAMINATION) -> tuple:
+    """Fit an Isolation Forest and return (flagged mask, anomaly score; higher = more anomalous)."""
+    iso = IsolationForest(n_estimators=OUTLIER_N_ESTIMATORS, contamination=contamination,
+                          random_state=RANDOM_STATE, n_jobs=-1).fit(features)
+    flags = iso.predict(features) == -1
+    scores = -iso.score_samples(features)
+    logger.info("Isolation Forest (contamination=%.2f): %d of %d jobs flagged",
+                contamination, int(flags.sum()), len(flags))
+    return flags, scores
+
+
+def salary_mismatch_z(jobs: pd.DataFrame, km_labels: np.ndarray) -> pd.Series:
+    """Return each job's log-salary z-score within its (K-Means cluster, experience_level) group.
+
+    The group is the job's skill profile plus seniority, so a large positive z is high pay for that
+    profile and a large negative z is low pay for it.
+    """
+    log_salary = np.log(jobs["normalized_salary"])
+    groups = [km_labels, jobs["experience_level"].to_numpy()]
+    mean = log_salary.groupby(groups).transform("mean")
+    std = log_salary.groupby(groups).transform("std")
+    return ((log_salary - mean) / std).fillna(0)
+
+
+def compact_outlier_features(features: pd.DataFrame, n_skills: pd.Series) -> np.ndarray:
+    """Return a sensitivity feature set: skills as SVD components + skill count, experience, salary.
+
+    With 245 binary skill columns, a random Isolation Forest split rarely lands on salary. Here the
+    skills are compressed to OUTLIER_SVD_COMPONENTS columns so salary is about 1 in 13 of the features.
+    """
+    skills = features.drop(columns=["experience_level", "normalized_salary"]).to_numpy(dtype=float)
+    svd = TruncatedSVD(n_components=OUTLIER_SVD_COMPONENTS, random_state=RANDOM_STATE).fit_transform(skills)
+    return np.column_stack([svd, n_skills, features["experience_level"], features["normalized_salary"]])
+
+
+def outlier_table(jobs: pd.DataFrame, flags: np.ndarray, scores: np.ndarray) -> pd.DataFrame:
+    """Return the flagged jobs with the 06_outliers.csv columns, most anomalous first."""
+    out = jobs.loc[flags, ["job_id", "job_title", "company_name", "normalized_salary", "salary_tier",
+                           "matched_skills"]].copy()
+    out["matched_skills"] = out["matched_skills"].map("; ".join)
+    out["anomaly_score"] = scores[flags].round(4)
+    return out.sort_values("anomaly_score", ascending=False).reset_index(drop=True)
+
+
+def describe_outliers(jobs: pd.DataFrame, matrix: pd.DataFrame, flags: np.ndarray, scores: np.ndarray,
+                      z: pd.Series, sensitivity_flags: np.ndarray) -> str:
+    """Build the outlier section of the Stage 6 summary.
+
+    Compares flagged jobs with all jobs (skills, salary, tier, experience), correlates the anomaly
+    score with each input, tests the salary-mismatch explanation, and reports the sensitivity run.
+    """
+    line = "=" * 80
+    n_skills = matrix.sum(axis=1)
+    exp_code = jobs["experience_level"].map(EXPERIENCE_TO_CODE).fillna(-1)
+    mismatch = z.abs() > MISMATCH_Z
+
+    def profile(mask: np.ndarray) -> dict:
+        """Summarize a subset of jobs."""
+        sub = jobs[mask]
+        tiers = sub["salary_tier"].value_counts(normalize=True).reindex(TIER_LABELS, fill_value=0)
+        return {"jobs": int(mask.sum()), "mean_skills": n_skills[mask].mean(),
+                "median_salary": sub["normalized_salary"].median(),
+                **{f"{t}_share": tiers[t] for t in TIER_LABELS},
+                "mismatch_share": mismatch[mask].mean(),
+                "high_for_profile": (z[mask] > MISMATCH_Z).mean(),
+                "low_for_profile": (z[mask] < -MISMATCH_Z).mean()}
+
+    everyone = np.ones(len(jobs), dtype=bool)
+    comparison = pd.DataFrame([{"group": "all jobs", **profile(everyone)},
+                               {"group": "flagged (main)", **profile(flags)},
+                               {"group": "flagged (sensitivity)", **profile(sensitivity_flags)}])
+    correlations = pd.Series({
+        "n_matched_skills": pd.Series(scores).corr(n_skills.reset_index(drop=True), method="spearman"),
+        "normalized_salary": pd.Series(scores).corr(jobs["normalized_salary"].reset_index(drop=True),
+                                                    method="spearman"),
+        "experience_level": pd.Series(scores).corr(exp_code.reset_index(drop=True), method="spearman"),
+    })
+    lift = (matrix[flags].mean() / matrix.mean()).where(matrix[flags].mean() >= 0.25).dropna()
+    experience = pd.DataFrame({
+        "all jobs": jobs["experience_level"].value_counts(normalize=True),
+        "flagged": jobs.loc[flags, "experience_level"].value_counts(normalize=True),
+    }).fillna(0).sort_values("all jobs", ascending=False)
+    overlap = (flags & sensitivity_flags).sum() / max(flags.sum(), 1)
+    driver = correlations.abs().idxmax()
+    return "\n".join([
+        f"{line}\nOutlier detection (Isolation Forest)\n{line}",
+        f"Features: {matrix.shape[1]} matched_skills multi-hot + experience_level ordinal + normalized_salary. "
+        f"contamination={OUTLIER_CONTAMINATION}, {OUTLIER_N_ESTIMATORS} trees, random_state={RANDOM_STATE}.",
+        f"Flagged {int(flags.sum()):,} of {len(jobs):,} jobs -> outputs/06_outliers.csv "
+        f"(anomaly_score = -score_samples, higher = more anomalous; range "
+        f"{scores[flags].min():.3f}-{scores[flags].max():.3f}).",
+        f"Salary mismatch = |z| > {MISMATCH_Z} for log salary within the job's (K-Means cluster, "
+        f"experience_level) group.",
+        "",
+        comparison.round(3).to_string(index=False),
+        "",
+        "Spearman correlation of anomaly score with each input:",
+        correlations.round(3).to_string(),
+        f"Strongest driver: {driver}.",
+        "",
+        "Experience level mix:",
+        experience.round(3).to_string(),
+        "",
+        "Skills most over-represented among flagged jobs (in >= 25% of them; lift vs all jobs):",
+        lift.sort_values(ascending=False).head(10).round(2).to_string(),
+        "",
+        f"Sensitivity run (skills -> SVD({OUTLIER_SVD_COMPONENTS}) + skill count + experience + salary): "
+        f"{int(sensitivity_flags.sum()):,} flagged, {overlap:.0%} overlap with the main run.",
+        "",
+        f"Conclusion: the anomaly score is driven by {driver} (Spearman {correlations[driver]:.2f}). "
+        f"Flagged jobs list {comparison.loc[1, 'mean_skills']:.1f} skills on average vs "
+        f"{comparison.loc[0, 'mean_skills']:.1f} overall. Salary mismatches make up "
+        f"{comparison.loc[1, 'mismatch_share']:.1%} of flagged jobs vs {comparison.loc[0, 'mismatch_share']:.1%} "
+        f"of all jobs ({comparison.loc[2, 'mismatch_share']:.1%} in the sensitivity run).",
+    ]) + "\n"
+
+
 def build_summary(n_jobs: int, n_clustered: int, n_skills: int, sweep: pd.DataFrame, best_k: int, kmeans_scores: dict,
                   dbscan: dict, dbscan_table: pd.DataFrame, comparison: pd.DataFrame, profiles: list,
-                  explained: float) -> str:
-    """Build the plain-text Stage 6 summary."""
+                  explained: float, outlier_section: str = "") -> str:
+    """Build the plain-text Stage 6 summary, ending with `outlier_section` if given."""
     line = "=" * 80
 
     def verdict(value, target, higher_is_better):
@@ -455,6 +595,8 @@ def build_summary(n_jobs: int, n_clustered: int, n_skills: int, sweep: pd.DataFr
         skills = ", ".join(p["skills"].index) if p["skills"] is not None else "-"
         parts.append(f"{p['cluster']:>2} {p['name']:<45} {p['size']:>6,} jobs  "
                      f"mean ${p['avg_salary']:>9,.0f}  High {p['tiers']['High']:.0%}  | {skills}")
+    if outlier_section:
+        parts += ["", outlier_section.rstrip("\n")]
     return "\n".join(parts) + "\n"
 
 
@@ -505,14 +647,25 @@ def run_pipeline(project_root: Path = None) -> dict:
     explained = plot_pca(X, km_fit, names, dbscan["labels"], output_dir / "06_clusters_pca.png")
     comparison = compare_representations(X, best_k)
     kmeans_scores = sweep.loc[sweep["k"] == best_k, ["silhouette", "davies_bouldin"]].iloc[0].to_dict()
+
+    features = outlier_features(jobs, matrix)
+    outlier_flags, anomaly_scores = detect_outliers(features)
+    sensitivity_flags, _ = detect_outliers(compact_outlier_features(features, matrix.sum(axis=1)))
+    outliers = outlier_table(jobs, outlier_flags, anomaly_scores)
+    outliers.to_csv(output_dir / "06_outliers.csv", index=False)
+    logger.info("Saved %s", output_dir / "06_outliers.csv")
+    z = salary_mismatch_z(jobs, km_labels)
+    outlier_section = describe_outliers(jobs, matrix, outlier_flags, anomaly_scores, z, sensitivity_flags)
+
     summary = build_summary(len(jobs), len(X), X.shape[1], sweep, best_k, kmeans_scores, dbscan, dbscan_table,
-                            comparison, profiles, explained)
+                            comparison, profiles, explained, outlier_section)
     (output_dir / "06_summary.txt").write_text(summary, encoding="utf-8")
     logger.info("Saved %s", output_dir / "06_summary.txt")
     return {"jobs": jobs, "matrix": matrix, "X": X, "has_skills": has_skills, "sweep": sweep,
             "best_k": best_k, "km_labels": km_labels, "dbscan": dbscan, "dbscan_table": dbscan_table,
             "db_labels": db_labels,
             "kdist": kdist, "names": names, "profiles": profiles, "comparison": comparison,
+            "outliers": outliers, "outlier_flags": outlier_flags, "anomaly_scores": anomaly_scores,
             "summary": summary}
 
 

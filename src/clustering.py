@@ -17,6 +17,13 @@ normalized_salary flags the OUTLIER_CONTAMINATION most anomalous postings. To te
 are salary mismatches (high pay for a low-skill profile or the reverse), each job's log salary is
 z-scored within its (K-Means cluster, experience_level) group.
 
+t-SNE (perplexity 30, 1,000 iterations) embeds the same job sample as the PCA plot, so the two
+2D views can be compared. Each view is scored by kNN overlap (how many of a job's PURITY_NEIGHBORS
+nearest neighbours in 2D are also its nearest neighbours in the 245-D space) and by purity (the
+share of those 2D neighbours with the same K-Means cluster or salary tier). High-tier hotspots are
+t-SNE regions where >= HOTSPOT_MIN_HIGH_SHARE of each job's HOTSPOT_NEIGHBORS neighbours are High tier,
+grouped with DBSCAN on the t-SNE coordinates.
+
 Run from the project root with:
     python -m src.clustering
 """
@@ -34,6 +41,7 @@ import pandas as pd
 from sklearn.cluster import DBSCAN, KMeans
 from sklearn.decomposition import PCA, TruncatedSVD
 from sklearn.ensemble import IsolationForest
+from sklearn.manifold import TSNE
 from sklearn.feature_extraction.text import TfidfTransformer
 from sklearn.metrics import davies_bouldin_score, silhouette_score
 from sklearn.neighbors import NearestNeighbors
@@ -61,7 +69,15 @@ TIER_LABELS = ["Low", "Mid", "High"]
 OUTLIER_CONTAMINATION = 0.01  # flag the top 1% most anomalous postings
 OUTLIER_N_ESTIMATORS = 300
 MISMATCH_Z = 2.0              # |z| of log salary within (cluster, experience) above this = salary mismatch
-OUTLIER_SVD_COMPONENTS = 10   # sensitivity run: skills compressed so salary carries more weight
+OUTLIER_SVD_COMPONENTS = 10
+PLOT_SAMPLE = 8000            # jobs shown in the PCA and t-SNE plots
+TSNE_PERPLEXITY = 30
+TSNE_MAX_ITER = 1000          # sklearn >= 1.7 calls n_iter max_iter
+PURITY_NEIGHBORS = 15
+HOTSPOT_NEIGHBORS = 30
+HOTSPOT_MIN_HIGH_SHARE = 0.7
+HOTSPOT_EPS = 3.0             # DBSCAN eps in t-SNE units
+HOTSPOT_MIN_SAMPLES = 20   # sensitivity run: skills compressed so salary carries more weight
 
 # Skill -> theme used to name clusters from their defining skills.
 SKILL_THEMES = {
@@ -97,6 +113,7 @@ TEXT_PRIMARY = "#0b0b0b"
 TEXT_SECONDARY = "#52514e"
 GRID = "#e6e5e1"
 NOISE_COLOR = "#c9c8c2"
+TIER_COLORS = {"Low": "#86b6ef", "Mid": "#256abf", "High": "#0d366b"}   # ordinal blue ramp
 CATEGORICAL = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#4a3aa7", "#e34948"]
 
 
@@ -360,7 +377,7 @@ def plot_pca(X: np.ndarray, km_labels: np.ndarray, km_names: dict, db_labels: np
     """
     pca = PCA(n_components=2, random_state=RANDOM_STATE).fit(X)
     rng = np.random.default_rng(RANDOM_STATE)
-    idx = rng.choice(len(X), size=min(sample, len(X)), replace=False)
+    idx = rng.choice(len(X), size=min(sample, len(X)), replace=False)   # same sample as plot_sample()
     coords = pca.transform(X[idx])
     jitter = rng.normal(scale=0.03, size=coords.shape)   # binary data stacks on identical points
     coords = coords + jitter
@@ -538,10 +555,164 @@ def describe_outliers(jobs: pd.DataFrame, matrix: pd.DataFrame, flags: np.ndarra
     ]) + "\n"
 
 
+def plot_sample(n: int, sample: int = PLOT_SAMPLE) -> np.ndarray:
+    """Return the fixed random sample of row indices shown in the 2D plots."""
+    rng = np.random.default_rng(RANDOM_STATE)
+    return rng.choice(n, size=min(sample, n), replace=False)
+
+
+def run_tsne(X: np.ndarray) -> np.ndarray:
+    """Embed X in 2D with t-SNE (perplexity TSNE_PERPLEXITY, TSNE_MAX_ITER iterations, PCA init)."""
+    coords = TSNE(n_components=2, perplexity=TSNE_PERPLEXITY, max_iter=TSNE_MAX_ITER, init="pca",
+                  learning_rate="auto", random_state=RANDOM_STATE, n_jobs=-1).fit_transform(X)
+    logger.info("t-SNE on %d jobs x %d skills", *X.shape)
+    return coords
+
+
+def knn_indices(coords: np.ndarray, k: int = PURITY_NEIGHBORS) -> np.ndarray:
+    """Return each point's k nearest neighbours (excluding itself) as an (n, k) index array."""
+    _, idx = NearestNeighbors(n_neighbors=k + 1).fit(coords).kneighbors(coords)
+    return idx[:, 1:]
+
+
+def compare_embeddings(X_sample: np.ndarray, pca_coords: np.ndarray, tsne_coords: np.ndarray,
+                       km_labels: np.ndarray, tiers: np.ndarray) -> pd.DataFrame:
+    """Score the full space, PCA 2D, and t-SNE 2D by kNN overlap with the full space and by label purity.
+
+    knn_overlap: share of a job's PURITY_NEIGHBORS nearest neighbours that are also its nearest
+    neighbours in the 245-D multi-hot space (1.0 for the full space itself). kmeans_purity and
+    tier_purity: share of the neighbours with the same K-Means cluster / salary tier. The chance row
+    is the sum of squared label shares (the purity of random neighbours).
+    """
+    full = knn_indices(X_sample)
+    rows = []
+    for name, coords in [("multi-hot (245-D)", X_sample), ("PCA 2D", pca_coords), ("t-SNE 2D", tsne_coords)]:
+        idx = full if coords is X_sample else knn_indices(coords)
+        overlap = np.mean([len(set(a) & set(b)) for a, b in zip(idx, full)]) / PURITY_NEIGHBORS
+        rows.append({"space": name, "knn_overlap": overlap,
+                     "kmeans_purity": float((km_labels[idx] == km_labels[:, None]).mean()),
+                     "tier_purity": float((tiers[idx] == tiers[:, None]).mean())})
+    chance = {"space": "chance", "knn_overlap": PURITY_NEIGHBORS / len(X_sample),
+              **{col: float((pd.Series(lab).value_counts(normalize=True) ** 2).sum())
+                 for col, lab in [("kmeans_purity", km_labels), ("tier_purity", tiers)]}}
+    return pd.DataFrame(rows + [chance])
+
+
+def high_tier_hotspots(tsne_coords: np.ndarray, tiers: np.ndarray, matrix_sample: pd.DataFrame,
+                       titles: pd.Series, km_labels: np.ndarray, km_names: dict,
+                       overall_share: pd.Series) -> pd.DataFrame:
+    """Find t-SNE regions dominated by High-tier jobs and describe each one.
+
+    A job is in a hotspot when >= HOTSPOT_MIN_HIGH_SHARE of its HOTSPOT_NEIGHBORS t-SNE neighbours are
+    High tier. Those jobs are grouped with DBSCAN (HOTSPOT_EPS, HOTSPOT_MIN_SAMPLES) on the t-SNE
+    coordinates. Each hotspot gets its size, High share, majority K-Means cluster, top skills by lift
+    (in >= 30% of its jobs), most common titles, and centre (for plot labels). Largest first.
+    """
+    high = tiers == "High"
+    _, idx = NearestNeighbors(n_neighbors=HOTSPOT_NEIGHBORS + 1).fit(tsne_coords).kneighbors(tsne_coords)
+    hot = np.flatnonzero(high[idx[:, 1:]].mean(axis=1) >= HOTSPOT_MIN_HIGH_SHARE)
+    if len(hot) == 0:
+        return pd.DataFrame()
+    labels = DBSCAN(eps=HOTSPOT_EPS, min_samples=HOTSPOT_MIN_SAMPLES).fit_predict(tsne_coords[hot])
+    rows = []
+    for c in sorted(set(labels) - {-1}):
+        members = hot[labels == c]
+        share = matrix_sample.iloc[members].mean()
+        lift = (share / overall_share).where(share >= 0.3).dropna().sort_values(ascending=False)
+        majority = pd.Series(km_labels[members]).value_counts()
+        rows.append({
+            "jobs": len(members),
+            "high_share": high[members].mean(),
+            "kmeans_majority": f"{km_names[majority.index[0]]} ({majority.iloc[0] / len(members):.0%})",
+            "top_skills": ", ".join(lift.index[:5]),
+            "top_titles": "; ".join(titles.iloc[members].value_counts().head(3).index),
+            "x": tsne_coords[members, 0].mean(),
+            "y": tsne_coords[members, 1].mean(),
+        })
+    return pd.DataFrame(rows).sort_values("jobs", ascending=False).reset_index(drop=True)
+
+
+def plot_tsne_vs_pca(pca_coords: np.ndarray, tsne_coords: np.ndarray, km_labels: np.ndarray, km_names: dict,
+                     tiers: np.ndarray, explained: float, path: Path, hotspots: pd.DataFrame = None) -> None:
+    """Save a 2x2 grid: PCA (top) and t-SNE (bottom), coloured by K-Means cluster (left) and salary tier (right).
+
+    Points are drawn in a shuffled order so no group is painted over the others. The t-SNE salary
+    panel labels each High-tier hotspot with its top skill and High share.
+    """
+    order = np.random.default_rng(RANDOM_STATE).permutation(len(tiers))
+    cluster_ids = sorted(km_names)
+    cluster_color = {c: CATEGORICAL[i % len(CATEGORICAL)] for i, c in enumerate(cluster_ids)}
+    colorings = [
+        ("K-Means cluster", np.array([cluster_color[c] for c in km_labels]),
+         [(cluster_color[c], f"{c}: {km_names[c]}") for c in cluster_ids]),
+        ("Salary tier", np.array([TIER_COLORS[t] for t in tiers]),
+         [(TIER_COLORS[t], t) for t in TIER_LABELS]),
+    ]
+    views = [(f"PCA ({explained:.1%} of variance)", pca_coords),
+             (f"t-SNE (perplexity {TSNE_PERPLEXITY}, {TSNE_MAX_ITER:,} iterations)", tsne_coords)]
+    fig, axes = plt.subplots(2, 2, figsize=(16, 14), dpi=150)
+    fig.patch.set_facecolor(SURFACE)
+    for r, (view, coords) in enumerate(views):
+        for c, (coloring, colors, legend) in enumerate(colorings):
+            ax = axes[r, c]
+            _style_axes(ax)
+            ax.scatter(coords[order, 0], coords[order, 1], s=6, alpha=0.55, c=colors[order], edgecolor="none")
+            ax.set_title(f"{view} — coloured by {coloring}", loc="left", color=TEXT_PRIMARY, fontsize=12)
+            ax.set_xticks([])
+            ax.set_yticks([])
+            handles = [ax.scatter([], [], s=40, color=col, label=lab) for col, lab in legend]
+            ax.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, 0), ncol=len(handles),
+                      frameon=False, labelcolor=TEXT_SECONDARY, fontsize=9)
+    if hotspots is not None and not hotspots.empty:
+        ax = axes[1, 1]
+        shown = hotspots[hotspots["jobs"] >= HOTSPOT_MIN_SAMPLES]
+        key = []
+        for i, (_, h) in enumerate(shown.iterrows(), start=1):
+            ax.scatter([h["x"]], [h["y"]], s=260, facecolor=SURFACE, edgecolor=TEXT_PRIMARY, linewidth=1.2,
+                       zorder=3)
+            ax.text(h["x"], h["y"], str(i), ha="center", va="center", fontsize=9, color=TEXT_PRIMARY, zorder=4)
+            key.append(f"{i}  {' + '.join(h['top_skills'].split(', ')[:2])}: "
+                       f"{h['high_share']:.0%} High, {h['jobs']} jobs")
+        ax.text(0.01, 0.99, "High-tier hotspots\n" + "\n".join(key), transform=ax.transAxes, ha="left",
+                va="top", fontsize=9, color=TEXT_PRIMARY, linespacing=1.5,
+                bbox=dict(boxstyle="round,pad=0.4", fc=SURFACE, ec=GRID, alpha=0.92))
+    fig.suptitle(f"PCA vs t-SNE of multi-hot skill vectors ({len(tiers):,} sampled jobs); "
+                 f"labels mark High-tier hotspots",
+                 x=0.01, ha="left", color=TEXT_PRIMARY, fontsize=14)
+    fig.tight_layout()
+    fig.savefig(path, facecolor=SURFACE)
+    plt.close(fig)
+    logger.info("Saved %s", path)
+
+
+def format_embedding_section(purity: pd.DataFrame, hotspots: pd.DataFrame, n_sample: int) -> str:
+    """Build the PCA vs t-SNE section of the Stage 6 summary."""
+    line = "=" * 80
+    row = purity.set_index("space")
+    cols = ["jobs", "high_share", "kmeans_majority", "top_skills", "top_titles"]
+    return "\n".join([
+        f"{line}\nPCA vs t-SNE (outputs/06_clusters_tsne.png)\n{line}",
+        f"t-SNE: perplexity {TSNE_PERPLEXITY}, {TSNE_MAX_ITER:,} iterations, PCA init, random_state={RANDOM_STATE}, "
+        f"on the same {n_sample:,}-job sample as the PCA plot. k = {PURITY_NEIGHBORS} neighbours.",
+        purity.round(3).to_string(index=False),
+        f"kNN overlap with the 245-D space: t-SNE {row.loc['t-SNE 2D', 'knn_overlap']:.1%} vs PCA "
+        f"{row.loc['PCA 2D', 'knn_overlap']:.1%}, so t-SNE keeps far more of each job's local neighbourhood.",
+        f"PCA has the higher K-Means purity ({row.loc['PCA 2D', 'kmeans_purity']:.2f} vs "
+        f"{row.loc['t-SNE 2D', 'kmeans_purity']:.2f}): K-Means splits along the top principal directions, so "
+        f"PCA draws its partition cleanly. Neither 2D view separates salary tiers much better than the full space "
+        f"(tier purity {row.loc['t-SNE 2D', 'tier_purity']:.2f} t-SNE, {row.loc['PCA 2D', 'tier_purity']:.2f} PCA, "
+        f"{row.loc['multi-hot (245-D)', 'tier_purity']:.2f} full, {row.loc['chance', 'tier_purity']:.2f} chance).",
+        "",
+        f"High-tier hotspots in t-SNE (>= {HOTSPOT_MIN_HIGH_SHARE:.0%} of {HOTSPOT_NEIGHBORS} neighbours High; "
+        f"DBSCAN eps {HOTSPOT_EPS}, min_samples {HOTSPOT_MIN_SAMPLES}):",
+        hotspots[cols].round(3).to_string(index=False) if not hotspots.empty else "none",
+    ]) + "\n"
+
+
 def build_summary(n_jobs: int, n_clustered: int, n_skills: int, sweep: pd.DataFrame, best_k: int, kmeans_scores: dict,
                   dbscan: dict, dbscan_table: pd.DataFrame, comparison: pd.DataFrame, profiles: list,
-                  explained: float, outlier_section: str = "") -> str:
-    """Build the plain-text Stage 6 summary, ending with `outlier_section` if given."""
+                  explained: float, extra_sections: list = None) -> str:
+    """Build the plain-text Stage 6 summary, ending with any `extra_sections` (pre-formatted text)."""
     line = "=" * 80
 
     def verdict(value, target, higher_is_better):
@@ -595,8 +766,8 @@ def build_summary(n_jobs: int, n_clustered: int, n_skills: int, sweep: pd.DataFr
         skills = ", ".join(p["skills"].index) if p["skills"] is not None else "-"
         parts.append(f"{p['cluster']:>2} {p['name']:<45} {p['size']:>6,} jobs  "
                      f"mean ${p['avg_salary']:>9,.0f}  High {p['tiers']['High']:.0%}  | {skills}")
-    if outlier_section:
-        parts += ["", outlier_section.rstrip("\n")]
+    for section in extra_sections or []:
+        parts += ["", section.rstrip("\n")]
     return "\n".join(parts) + "\n"
 
 
@@ -645,6 +816,18 @@ def run_pipeline(project_root: Path = None) -> dict:
     logger.info("Saved %s", output_dir / "06_cluster_labels.csv")
 
     explained = plot_pca(X, km_fit, names, dbscan["labels"], output_dir / "06_clusters_pca.png")
+    sample = plot_sample(len(X))
+    X_sample = X[sample]
+    pca_coords = PCA(n_components=2, random_state=RANDOM_STATE).fit(X).transform(X_sample)
+    tsne_coords = run_tsne(X_sample)
+    tiers_sample = jobs.loc[has_skills, "salary_tier"].to_numpy()[sample]
+    purity = compare_embeddings(X_sample, pca_coords, tsne_coords, km_fit[sample], tiers_sample)
+    hotspots = high_tier_hotspots(tsne_coords, tiers_sample, matrix[has_skills].iloc[sample],
+                                  jobs.loc[has_skills, "job_title"].iloc[sample], km_fit[sample], names,
+                                  matrix.mean())
+    jitter = np.random.default_rng(RANDOM_STATE).normal(scale=0.03, size=pca_coords.shape)
+    plot_tsne_vs_pca(pca_coords + jitter, tsne_coords, km_fit[sample], names, tiers_sample, explained,
+                     output_dir / "06_clusters_tsne.png", hotspots)
     comparison = compare_representations(X, best_k)
     kmeans_scores = sweep.loc[sweep["k"] == best_k, ["silhouette", "davies_bouldin"]].iloc[0].to_dict()
 
@@ -658,14 +841,15 @@ def run_pipeline(project_root: Path = None) -> dict:
     outlier_section = describe_outliers(jobs, matrix, outlier_flags, anomaly_scores, z, sensitivity_flags)
 
     summary = build_summary(len(jobs), len(X), X.shape[1], sweep, best_k, kmeans_scores, dbscan, dbscan_table,
-                            comparison, profiles, explained, outlier_section)
+                            comparison, profiles, explained,
+                            [format_embedding_section(purity, hotspots, len(sample)), outlier_section])
     (output_dir / "06_summary.txt").write_text(summary, encoding="utf-8")
     logger.info("Saved %s", output_dir / "06_summary.txt")
     return {"jobs": jobs, "matrix": matrix, "X": X, "has_skills": has_skills, "sweep": sweep,
             "best_k": best_k, "km_labels": km_labels, "dbscan": dbscan, "dbscan_table": dbscan_table,
             "db_labels": db_labels,
             "kdist": kdist, "names": names, "profiles": profiles, "comparison": comparison,
-            "outliers": outliers, "outlier_flags": outlier_flags, "anomaly_scores": anomaly_scores,
+            "tsne_coords": tsne_coords, "purity": purity, "hotspots": hotspots, "outliers": outliers, "outlier_flags": outlier_flags, "anomaly_scores": anomaly_scores,
             "summary": summary}
 
 

@@ -5,7 +5,7 @@
 
 ## Abstract
 
-We mine 34,179 salaried U.S. LinkedIn postings, using a 245-skill vocabulary built from 1.3 million skill lists, to ask which skills co-occur and predict pay, whether role archetypes exist beyond titles, and whether salary tier is predictable. Apriori finds 91 rules (lift up to 5.54). Technical combinations such as {computer science, design, engineering} are 83% High-tier, 2.5× the baseline. Clustering finds only a weak continuum (silhouette ≤ 0.21), yet it separates a technical profile earning $50k more than service roles. Tuned XGBoost reaches ROC-AUC 0.891 but macro F1 0.728, short of the 0.75 target.
+We mine 34,179 salaried U.S. LinkedIn postings, using a 245-skill vocabulary built from 1.3 million skill lists, to ask which skills co-occur and predict pay, whether role archetypes exist beyond titles, and whether salary tier is predictable. Apriori finds 91 rules (lift up to 5.54). Technical combinations such as {computer science, design, engineering} are 83% High-tier, 2.5× the baseline. Clustering finds only a weak continuum (silhouette ≤ 0.21), yet it separates a technical profile earning $50k more than service roles. t-SNE finds small well-paid pockets that the partition misses, such as acute-care nursing. Isolation Forest outliers turn out to be skill-dense postings, not salary mismatches. Tuned XGBoost reaches ROC-AUC 0.891 but macro F1 0.728, short of the 0.75 target. Ordinal models do not close the gap.
 
 ## 1. Introduction
 
@@ -59,9 +59,9 @@ Three public Kaggle datasets are used:
 | 1. Ingestion | Profiled all 15 raw tables: shapes, types, nulls, samples | Find join keys, salary quirks (mixed pay periods), and missing data before modeling |
 | 2. Preprocessing | Joins, salary annualization and filtering, de-duplication, tiering, regex skill extraction | Gives one clean row per job with comparable annual salaries and concrete skills |
 | 3. Warehousing | SQLite star schema: fact `job_postings` at the (job, skill) grain (449,665 rows), dimensions for skills, location, company, time, and industry (with a bridge table), and a one-row-per-job view `v_jobs`. OLAP queries: top skills, salary by experience, industry × state | Supports slicing by any dimension. The job-level view prevents a salary being counted once per skill |
-| 4. Association mining | Apriori [1] (min support 0.05; confidence > 0.5; lift > 1.5) on all jobs and on High-tier jobs. NetworkX co-occurrence graph | Apriori is the standard, interpretable way to mine frequent itemsets. Lift controls for skills that are common everywhere. For each High-tier rule, *high-tier lift* = the High share among **all** jobs with that skill combination ÷ 33.3%. It tests whether a combination actually predicts pay |
-| 5. Classification | Features: 245 multi-hot skills, number of matched skills, experience level (ordinal), company size (ordinal, 9 buckets), top-20 states, and top-15 industries. Four models: Logistic Regression (baseline), Random Forest [2], XGBoost [3], and XGBoost + TF-IDF of the top 50 title words and top 30 company-name words. Model 4 is tuned by a 3-fold CV grid search on the training data only (max depth {4, 6, 8} × trees {200, 400} × learning rate {0.05, 0.1} × subsample {0.8, 1.0}). 80/20 stratified split, `random_state=42` | Linear baseline → bagged trees → boosted trees shows how much non-linear interaction helps. Macro F1 and one-vs-rest ROC-AUC treat the three balanced classes equally |
-| 6. Clustering | K-Means [4] (k = 3–10, chosen by silhouette, with an elbow check) and DBSCAN [5] (min_samples 20, eps chosen from the k-distance graph). Scored with silhouette [6] and Davies-Bouldin [7]. Clusters named from skills over-represented in them (lift) | K-Means tests whether the data splits into a few compact archetypes. DBSCAN tests for dense groups of arbitrary shape and lets outliers be labelled as noise |
+| 4. Association mining | Apriori [1] (min support 0.05; confidence > 0.5; lift > 1.5) on all jobs and on High-tier jobs. NetworkX co-occurrence graph. A second pass at min support 0.02 keeps rules that involve one of the 50 technical skills | Apriori is the standard, interpretable way to mine frequent itemsets. Lift controls for skills that are common everywhere. For each High-tier rule, *high-tier lift* = the High share among **all** jobs with that skill combination ÷ 33.3%. It tests whether a combination actually predicts pay |
+| 5. Classification | Features: 245 multi-hot skills, number of matched skills, experience level (ordinal), company size (ordinal, 9 buckets), top-20 states, and top-15 industries. Four models: Logistic Regression (baseline), Random Forest [2], XGBoost [3], and XGBoost + TF-IDF of the top 50 title words and top 30 company-name words. Model 4 is tuned by a 3-fold CV grid search on the training data only (max depth {4, 6, 8} × trees {200, 400} × learning rate {0.05, 0.1} × subsample {0.8, 1.0}). Ordinal experiment: Models 5-6 are Ordinal Ridge and Logistic IT [10] (`mord`) on Model 4's features, standardized, with a same-feature multinomial Logistic Regression as a control. 80/20 stratified split, `random_state=42` | Linear baseline → bagged trees → boosted trees shows how much non-linear interaction helps. Ordinal models use the Low < Mid < High order, which could reduce Mid-tier errors. Macro F1 and one-vs-rest ROC-AUC treat the three balanced classes equally |
+| 6. Clustering | K-Means [4] (k = 3–10, chosen by silhouette, with an elbow check) and DBSCAN [5] (min_samples 20, eps chosen from the k-distance graph). Scored with silhouette [6] and Davies-Bouldin [7]. Clusters named from skills over-represented in them (lift). t-SNE [9] (perplexity 30, 1,000 iterations) on an 8,000-job sample, compared with PCA. **Outlier detection:** Isolation Forest [8] (300 trees, contamination 0.01) on the 245 skill columns + experience level (ordinal) + `normalized_salary`. To test whether outliers are salary mismatches, each job's log salary is z-scored within its (K-Means cluster, experience level) group; \|z\| > 2 counts as a mismatch | K-Means tests whether the data splits into a few compact archetypes. DBSCAN tests for dense groups of arbitrary shape and lets outliers be labelled as noise. t-SNE keeps local neighbourhoods that a linear projection loses. Isolation Forest isolates unusual postings without assuming a distribution, and needs no feature scaling |
 
 **Leakage controls.**
 - Everything learned from data (top states and industries, TF-IDF vocabularies, hyperparameters) is fit on the training split only.
@@ -95,6 +95,20 @@ Three public Kaggle datasets are used:
 
 Skills that appear together often don't necessarily pay well. {powerpoint, excel} has the second-highest co-occurrence lift (5.42), but only 29.0% of jobs listing both are High tier (high-tier lift 0.87). {training, education} is similar at 29.2% High (0.88).
 
+**Technical rules at lower support (0.02).** Only 14.8% of postings mention a technical skill, so the 5% pass cannot produce technical rules. At 2% support, only agile (4.8%), sql (4.2%), python (3.9%), aws (2.6%), and azure (2.2%) are frequent on their own. **10 technical rules** pass the filters, and **all 10 are new** (support 2.2-3.6%).
+- Each pairs python, sql, or agile with a generic skill (engineering, design, development). No rule links two technical skills.
+- All 10 predict High pay, at 66-81% High tier. Seven of the itemsets were already in the High-tier rules. The three new high-pay combinations are {python, development} (78% High, 864 jobs), {sql, design} (71%, 773), and {sql, development} (66%, 888).
+- Pairs of *two* technical skills stay below 2% (the most common, python + sql, is 1.5%), but they are the best-paid combinations in the data:
+
+| Technical pair | Jobs | Share in High tier | High-tier lift |
+|---|---|---|---|
+| aws + python | 353 | **88.1%** | **2.65** |
+| agile + aws | 264 | 87.9% | 2.64 |
+| machine learning + python | 303 | 84.8% | 2.55 |
+| java + python | 311 | 83.6% | 2.51 |
+| aws + azure | 355 | 82.5% | 2.48 |
+| python + sql | 524 | 72.5% | 2.18 |
+
 At the level of single skills, the spread in median salary is large:
 - **Highest median salaries:** machine learning **$163,250**, Kubernetes $150,800, C++ $148,225, GCP $147,424, AWS $145,000, Python $140,000.
 - **Lowest median salaries:** cash handling **$42,640**, cleaning $44,720, bending $44,720, merchandising $45,760, high school diploma $46,800.
@@ -121,6 +135,36 @@ The K-Means partition is weak geometrically, but it is meaningful economically:
 
 - **Salary gaps.** The technical cluster earns **$50.0k more on average** (median gap $60k) than the service and retail cluster. It also earns $31.2k more than the management cluster.
 - **The third cluster is not a clean archetype.** It is mostly a leftover group of postings that list few skills, with only one weakly over-represented skill (customer service, lift 1.13).
+
+**t-SNE vs PCA.** t-SNE also shows one connected mass, with no hidden islands, which agrees with the low silhouette.
+
+| 2D view (8,000 jobs, k = 15) | kNN overlap with 245-D space | K-Means purity | Salary-tier purity |
+|---|---|---|---|
+| PCA | 3.0% | 0.85 | 0.44 |
+| t-SNE | **18.1%** | 0.70 | 0.47 |
+| Chance | 0.2% | 0.39 | 0.33 |
+
+- t-SNE keeps six times more of each job's true neighbours than PCA.
+- PCA draws the K-Means partition more cleanly, because K-Means splits along the top principal directions.
+- That local fidelity reveals **High-tier pockets** (regions where ≥ 70% of a job's 30 neighbours are High tier):
+  - a software-engineering core (java, software development, python; 321 sampled jobs, 83% High)
+  - product and account roles (marketing, sales; 79 jobs, 75% High)
+  - innovation and project-management roles (34 jobs, 79% High)
+  - **acute-care nursing** (ACLS, BLS, registered nurse; 38 jobs, 79% High)
+- K-Means puts 97% of the acute-care nursing pocket in *Sales, Retail & Customer Service*, its lowest-paid cluster. This is a well-paid niche that a hard 3-way partition cannot represent.
+
+**Outlier detection.** Isolation Forest flags 342 postings (1%).
+
+| Group | Jobs | Mean skills | Median salary | High tier | Salary mismatch (\|z\| > 2) |
+|---|---|---|---|---|---|
+| All jobs | 34,179 | 11.5 | $82,500 | 33.3% | 4.5% |
+| Flagged (main run) | 342 | **30.8** | $117,720 | 58.2% | **5.6%** |
+| Flagged (sensitivity: skills → SVD(10)) | 342 | 26.9 | $163,515 | 75.4% | 9.9% |
+
+- **Postings are anomalous because they list many skills.** The anomaly score has Spearman correlation **0.95** with the number of matched skills, against 0.20 with salary and 0.09 with experience level.
+- Flagged postings list 2.7× more skills than average. They are long, kitchen-sink descriptions: cleared government roles ("logistics management specialist with security clearance"), lead and director tech roles, and senior clinical roles. They are over-represented at Mid-Senior, Director, and Executive levels.
+- **They are not salary mismatches.** Only 5.6% are paid more than two standard deviations above or below their cluster-and-experience group, barely above the 4.5% rate across all jobs.
+- **Sensitivity check.** Compressing the skills to 10 SVD components gives salary more weight. This run overlaps the main run by only 38%. It flags more expensive jobs (75% High), but still only 9.9% are salary mismatches.
 
 ### Q3 — Predicting salary tier (classification)
 
@@ -151,6 +195,20 @@ Test set: 6,836 jobs (20%, stratified), with 285 base features.
 
 The company-name words turned out to be generic ("america", "bank", "health", "group") and added no signal.
 
+**Negative result: ordinal classification.** Treating the tiers as ordered does not help.
+
+| Model (base + title & company TF-IDF features) | Macro F1 | Mid-tier F1 | ROC-AUC | Test jobs predicted Mid |
+|---|---|---|---|---|
+| XGBoost + TF-IDF (Model 4, best) | **0.728** | **0.615** | **0.891** | 32% |
+| Logistic Regression, multinomial (control) | 0.667 | 0.535 | 0.849 | 29% |
+| Logistic IT, ordinal (Model 6) | 0.642 | 0.485 | 0.820 | 32% |
+| Ordinal Ridge (Model 5) | 0.607 | 0.559 | 0.817 | 57% |
+
+- **Both ordinal models score below the unordered control on the same features**, and far below Model 4.
+- Ordinal Ridge's higher Mid F1 (0.559 vs 0.535) is an artefact. Rounding a regression output pulls predictions toward the middle, so it calls 57% of test jobs Mid when the true share is 33%. That lowers Low and High F1, and its macro F1 is 0.060 below the control.
+- A single linear score with two cut points cannot place Mid jobs better. Mid postings differ from Low and High in *which* skills and title words they contain, not in more or less of one ordered signal.
+- Ordinal Ridge has no class probabilities. Its ROC-AUC uses the continuous output *s* as tier scores −*s*, −\|*s* − 1\|, and *s*.
+
 ## 5. Discussion
 
 **What this means for job seekers.**
@@ -170,6 +228,13 @@ The company-name words turned out to be generic ("america", "bank", "health", "g
 - **The result holds across methods.** Neither k nor DBSCAN's eps changes this, and a TF-IDF + SVD representation only reaches 0.14.
 - **So the answer to Q2 is "weakly".** The data supports broad, overlapping *profiles* rather than crisp archetypes.
 
+**What outlier detection found.**
+- The unusual postings in this data are **unusually long descriptions, not unusually paid jobs**. A posting with 30-50 matched skills is far from almost every other job in the 245-dimensional skill space, so Isolation Forest isolates it in a few splits. Its salary, a single column, rarely decides the isolation.
+- **Salary mismatches are rare and diffuse.** About 4.5% of jobs are paid 2 SD away from their skill-and-seniority group, and the outliers contain barely more. Salary given the posting's skills is noisy everywhere, which matches the Mid-tier ceiling in Q3, rather than concentrated in a few anomalous ads.
+- **Implications.**
+  - Skill counts partly reflect how verbose a description is, not only what the job needs. Normalizing for description length, or capping skills per job, would make clustering and classification less sensitive to boilerplate-heavy ads.
+  - Finding salary anomalies directly needs a salary model: flag large residuals from a regression of salary on skills and seniority, rather than running a general-purpose detector on the joint feature space.
+
 **What the larger technical vocabulary changed.**
 - Expanding from 100 to 245 skills raised skills per job from 8.2 to 11.5.
 - It improved every classifier by 0.01–0.02 F1 and almost doubled K-Means silhouette (0.031 → 0.056).
@@ -182,22 +247,25 @@ The company-name words turned out to be generic ("america", "bank", "health", "g
 - Skills cluster into clear pairs: accounting–finance (lift 5.54), Excel–PowerPoint (5.42), engineering–design (2.64), and marketing–sales (2.52).
 - High pay is predicted by technical combinations such as {computer science, design, engineering} and {python, engineering}. These are 80–83% High tier, about 2.5× the baseline.
 - Common office and training skill sets fall below the baseline.
+- At 2% support, the technical rules add {python, development} and {sql, design}. Rarer pairs of two technical skills (aws + python, machine learning + python) are the best paid, at 85-88% High tier.
 
 **Q2 — Do role archetypes exist beyond job titles?**
 - Only weakly. Silhouette scores (≤ 0.21) are far below 0.50, and no clustering method finds well-separated groups.
 - Even so, a skill-defined technical profile appears across many titles: software, electrical, and manufacturing engineers, and some project managers. It earns $50k more than the service and retail profile.
+- t-SNE confirms the continuum but finds small well-paid pockets that the partition hides. The clearest is acute-care nursing, 79% High tier but filed under the service cluster.
+- The 1% most anomalous postings are skill-dense descriptions (30.8 vs 11.5 skills), not salary mismatches.
 
 **Q3 — Can salary tier be predicted from posting features alone?**
 - Partly. The best model (tuned XGBoost with title and company TF-IDF) reaches ROC-AUC 0.891, well above the 0.80 target, and rarely confuses Low with High.
 - Its macro F1 is 0.728, short of the 0.75 target, because the Mid-tier boundary is not identifiable from posting text.
+- Ordinal models (Ordinal Ridge 0.607, Logistic IT 0.642) do not help. Both trail an unordered linear control (0.667).
 
 **Future work.**
-1. Predict salary with regression, then bin the prediction into tiers. Alternatively, use ordinal classification so near-boundary errors are penalized less.
+1. Predict salary with regression, then bin the prediction into tiers. Linear ordinal classifiers were tried and did not help (Section 4, Q3). A non-linear ordinal model, such as gradient boosting with cumulative-logit loss, remains untested. Regression residuals would also give a direct way to detect salary anomalies.
 2. Use richer text features from job descriptions, such as sentence embeddings, after removing any stated salary figures.
 3. Adjust salaries for metro-level cost of living, and add company-level pay history.
 4. Extract skills with domain-specific vocabularies or NER models for healthcare and the trades.
 5. Use soft or overlapping clustering (topic models, Gaussian mixtures) to describe the skill continuum better than hard partitions do.
-6. Add outlier detection to find unusually paid postings.
 
 ## References
 
@@ -214,6 +282,12 @@ The company-name words turned out to be generic ("america", "bank", "health", "g
 [6] P. J. Rousseeuw, "Silhouettes: A graphical aid to the interpretation and validation of cluster analysis," *J. Computational and Applied Mathematics*, vol. 20, pp. 53–65, 1987.
 
 [7] D. L. Davies and D. W. Bouldin, "A cluster separation measure," *IEEE Trans. Pattern Analysis and Machine Intelligence*, vol. PAMI-1, no. 2, pp. 224–227, 1979.
+
+[8] F. T. Liu, K. M. Ting, and Z.-H. Zhou, "Isolation forest," in *Proc. 8th IEEE Int. Conf. Data Mining (ICDM)*, Pisa, Italy, 2008, pp. 413–422.
+
+[9] L. van der Maaten and G. Hinton, "Visualizing data using t-SNE," *J. Machine Learning Research*, vol. 9, pp. 2579–2605, 2008.
+
+[10] J. D. M. Rennie and N. Srebro, "Loss functions for preference levels: Regression with discrete ordered labels," in *Proc. IJCAI Multidisciplinary Workshop on Advances in Preference Handling*, Edinburgh, U.K., 2005, pp. 180–186.
 
 **Datasets:**
 - arshkon, "LinkedIn Job Postings (2023–2024)," Kaggle. https://www.kaggle.com/datasets/arshkon/linkedin-job-postings

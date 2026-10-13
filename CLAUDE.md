@@ -145,6 +145,7 @@ Local environment: Homebrew Python blocks `pip install` (PEP 668), so the projec
 **Status: complete.** Run with `python -m src.association` (~2 s). Transactions = `matched_skills`.
 - All jobs: 343 frequent itemsets, 91 rules pass the filters, graph has 40 skills / 191 edges. The plot draws edges with lift >= 1.2 (`PLOT_MIN_LIFT`)
 - High-tier jobs only: 277 rules → `outputs/04_high_salary_rules.csv`. Each rule has `jobs_with_itemset`, `high_tier_rate`, and `high_tier_lift` (High share among ALL jobs with the itemset ÷ 33.3% baseline), which shows whether a combination actually predicts High pay
+- Low-support pass (`LOW_SUPPORT` = 0.02, all jobs, same filters; technical = `FORCED_SKILLS`) → `outputs/04_technical_rules_low_support.csv`. Only agile/sql/python/aws/azure reach 2%. 10 technical rules, all new (support < 0.05), each pairing python/sql/agile with engineering/design/development, 66-81% High. Three are not already in the High-tier rules: python+development, sql+design, sql+development. Tech-tech pairs stay < 2% (python+sql 1.5%) but are the best paid (aws+python 88% High); `technical_pairs()` lists them
 - Summary: `outputs/04_summary.txt`
 
 ### Stage 5 — Classification (`notebooks/05_classification.ipynb`, `src/classification.py`)
@@ -205,12 +206,13 @@ Top states and industries are chosen on the train split only.
   - Management & Leadership (31%, mean $101k)
   - Sales, Retail & Customer Service (51%, mean $82k)
 - **Outlier detection:** Isolation Forest (contamination 0.01, 300 trees) on multi-hot skills + experience ordinal + salary flags 342 jobs → `06_outliers.csv`. The anomaly score is driven by skill count (Spearman 0.95; flagged jobs average 30.8 skills vs 11.5), **not** salary mismatch: 5.6% of flagged jobs have |z| > 2 log-salary within their (cluster, experience) group, vs 4.5% overall. Sensitivity run (skills → SVD(10)): 38% overlap, 9.9% mismatches
-- **Outputs:** `06_cluster_labels.csv`, `06_outliers.csv`, `06_elbow_plot.png`, `06_kdistance_plot.png`, `06_clusters_pca.png`, `06_cluster_profiles.txt`, `06_summary.txt`
+- **t-SNE** (perplexity 30, `max_iter` 1000, same 8,000-job sample as PCA) → `06_clusters_tsne.png` (2×2: PCA/t-SNE × K-Means cluster/salary tier). kNN overlap with 245-D: t-SNE 18.1% vs PCA 3.0%. Still one mass, no islands. High-tier hotspots (≥ 70% of 30 neighbours High, DBSCAN on t-SNE): software eng. (83% High), product/account roles, and **acute-care nursing (ACLS/BLS/RN, 79% High), 97% of which K-Means puts in the Service cluster**
+- **Outputs:** `06_cluster_labels.csv`, `06_outliers.csv`, `06_clusters_tsne.png`, `06_elbow_plot.png`, `06_kdistance_plot.png`, `06_clusters_pca.png`, `06_cluster_profiles.txt`, `06_summary.txt`
 
 ---
 
 ### Final Report
-**Status: complete.** `outputs/final_report.md`: paper-style write-up (abstract, dataset, methodology, Q1-Q3 results, discussion, conclusion, IEEE references). The references are 7 standard method papers because the proposal isn't in the repo; swap them in if they differ.
+**Status: complete.** `outputs/final_report.md`: paper-style write-up (abstract, dataset, methodology, Q1-Q3 results, discussion, conclusion, IEEE references). It covers the low-support technical rules (Q1), t-SNE and outliers (Q2), and the ordinal negative result (Q3). The references are 10 standard method papers because the proposal isn't in the repo; swap them in if they differ.
 
 ---
 

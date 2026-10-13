@@ -5,6 +5,10 @@ Mines skill association rules from the `matched_skills` of each job in
 jobs only. High-tier rules are scored against all jobs, to show which skill combinations
 are associated with higher pay rather than just common among well-paid jobs.
 
+A low-support pass (LOW_SUPPORT) re-mines all jobs to surface rules that involve a technical
+skill (FORCED_SKILLS from Stage 2). Few postings mention technical skills, so their rules fall
+below MIN_SUPPORT.
+
 Run from the project root with:
     python -m src.association
 """
@@ -23,7 +27,7 @@ from matplotlib.colors import LinearSegmentedColormap, Normalize
 from mlxtend.frequent_patterns import apriori, association_rules
 from mlxtend.preprocessing import TransactionEncoder
 
-from src.preprocessing import find_project_root, load_cleaned_jobs
+from src.preprocessing import FORCED_SKILLS, find_project_root, load_cleaned_jobs
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +39,9 @@ TOP_N_RULES = 20
 PLOT_MIN_LIFT = 1.2    # only edges at or above this lift are drawn in the network plot
 NODE_MAX_AREA = 2400   # marker area (pt^2) of the most frequent skill
 HIGH_TIER = "High"
+LOW_SUPPORT = 0.02     # second pass for technical-skill rules
+TECHNICAL_SKILLS = frozenset(FORCED_SKILLS)
+TOP_TECH_PAIRS = 10
 
 RULE_COLUMNS = ["antecedents", "consequents", "antecedent support", "consequent support",
                 "support", "confidence", "lift", "leverage", "conviction"]
@@ -190,6 +197,89 @@ def plot_skill_network(graph: nx.Graph, path: Path, title: str, min_lift: float 
                 path, shown.number_of_nodes(), shown.number_of_edges(), min_lift)
 
 
+def is_technical(items: frozenset) -> bool:
+    """Return True if the itemset contains at least one technical skill."""
+    return bool(items & TECHNICAL_SKILLS)
+
+
+def technical_low_support_rules(onehot_all: pd.DataFrame, is_high: pd.Series,
+                                rules_high: pd.DataFrame) -> tuple:
+    """Re-mine all jobs at LOW_SUPPORT and keep rules that involve a technical skill.
+
+    Uses the same confidence and lift filters as the main pass. Each rule gets the High-tier
+    metrics from `add_high_tier_metrics`, plus:
+      new_below_main_support - the rule's itemset is below MIN_SUPPORT, so the main pass missed it
+      in_high_tier_rules     - the same itemset appears in the High-tier-only rules (04_high_salary_rules.csv)
+    Returns (frequent itemsets at LOW_SUPPORT, technical rules sorted by high_tier_lift).
+    """
+    itemsets = mine_frequent_itemsets(onehot_all, LOW_SUPPORT)
+    rules = generate_rules(itemsets)
+    tech = rules[[is_technical(a | c) for a, c in zip(rules["antecedents"], rules["consequents"])]]
+    tech = add_high_tier_metrics(tech, onehot_all, is_high)
+    high_itemsets = {a | c for a, c in zip(rules_high["antecedents"], rules_high["consequents"])}
+    tech["new_below_main_support"] = tech["support"] < MIN_SUPPORT
+    tech["in_high_tier_rules"] = [(a | c) in high_itemsets for a, c in zip(tech["antecedents"], tech["consequents"])]
+    tech = tech.sort_values("high_tier_lift", ascending=False).reset_index(drop=True)
+    logger.info("Low-support pass (min_support=%.2f): %d rules, %d involve a technical skill",
+                LOW_SUPPORT, len(rules), len(tech))
+    return itemsets, tech
+
+
+def technical_pairs(onehot_all: pd.DataFrame, is_high: pd.Series, top_n: int = TOP_TECH_PAIRS) -> pd.DataFrame:
+    """Return the most common pairs of two technical skills, with support, lift, and High-tier rate."""
+    cols = [c for c in onehot_all.columns if c in TECHNICAL_SKILLS]
+    X = onehot_all[cols].to_numpy(dtype=np.int32)
+    counts = X.T @ X
+    single = np.diag(counts)
+    n, high = len(X), is_high.to_numpy()
+    rows = []
+    for i in range(len(cols)):
+        for j in range(i + 1, len(cols)):
+            if counts[i, j] == 0:
+                continue
+            both = (X[:, i] & X[:, j]).astype(bool)
+            rows.append({"pair": f"{cols[i]} + {cols[j]}", "jobs": int(counts[i, j]), "support": counts[i, j] / n,
+                         "lift": counts[i, j] * n / (single[i] * single[j]),
+                         "high_tier_rate": high[both].mean()})
+    pairs = pd.DataFrame(rows).sort_values("jobs", ascending=False).head(top_n)
+    pairs["high_tier_lift"] = pairs["high_tier_rate"] / high.mean()
+    return pairs.reset_index(drop=True)
+
+
+def format_low_support_section(itemsets: pd.DataFrame, tech_rules: pd.DataFrame, onehot_all: pd.DataFrame,
+                               pairs: pd.DataFrame) -> str:
+    """Build the low-support technical-rules section of the Stage 4 summary."""
+    line = "=" * 80
+    support = onehot_all.mean()
+    frequent_tech = support[[c for c in support.index if c in TECHNICAL_SKILLS]].sort_values(ascending=False)
+    show = ["antecedents", "consequents", "support", "confidence", "lift", "jobs_with_itemset",
+            "high_tier_rate", "high_tier_lift", "new_below_main_support", "in_high_tier_rules"]
+    new = tech_rules[tech_rules["new_below_main_support"]]
+    new_high = new[(new["high_tier_lift"] > 1.2) & ~new["in_high_tier_rules"]]
+    tech_skills_in_rules = sorted(set().union(*[(a | c) & TECHNICAL_SKILLS for a, c in
+                                                zip(tech_rules["antecedents"], tech_rules["consequents"])]))
+    return "\n".join([
+        f"{line}\nLow-support pass: technical-skill rules (outputs/04_technical_rules_low_support.csv)\n{line}",
+        f"min_support={LOW_SUPPORT} on all jobs, same filters (confidence > {MIN_CONFIDENCE}, lift > {MIN_LIFT}). "
+        f"Technical = the {len(TECHNICAL_SKILLS)} forced technical skills from Stage 2.",
+        f"Frequent itemsets: {len(itemsets):,} (by size: {itemsets['length'].value_counts().sort_index().to_dict()})",
+        f"Technical skills with support >= {LOW_SUPPORT:.0%}: "
+        + ", ".join(f"{s} {v:.1%}" for s, v in frequent_tech[frequent_tech >= LOW_SUPPORT].items()),
+        f"Technical skills between 1% and {LOW_SUPPORT:.0%}: "
+        + ", ".join(f"{s} {v:.1%}" for s, v in frequent_tech[(frequent_tech >= 0.01) & (frequent_tech < LOW_SUPPORT)].items()),
+        f"Rules involving a technical skill: {len(tech_rules)}; new (itemset support < {MIN_SUPPORT}): {len(new)}. "
+        f"Technical skills in these rules: {', '.join(tech_skills_in_rules) or '-'}",
+        f"New rules with high_tier_lift > 1.2 not already in 04_high_salary_rules.csv: {len(new_high)}",
+        "",
+        format_rules(tech_rules)[show].to_string(index=False),
+        "",
+        f"Most common pairs of two technical skills (highest support {pairs['support'].max():.2%}; "
+        f"pairs below {LOW_SUPPORT:.0%} cannot form rules in this pass):",
+        pairs.round(4).to_string(index=False),
+        "",
+    ])
+
+
 def build_summary(n_all: int, n_high: int, itemsets_all: pd.DataFrame, itemsets_high: pd.DataFrame,
                   rules_all: pd.DataFrame, rules_high: pd.DataFrame, graph: nx.Graph) -> str:
     """Build the plain-text Stage 4 summary."""
@@ -269,10 +359,15 @@ def run_pipeline(project_root: Path = None) -> dict:
 
     summary = build_summary(len(onehot_all), len(onehot_high), itemsets_all, itemsets_high,
                             rules_all, rules_high, graph)
+    itemsets_low, tech_rules = technical_low_support_rules(onehot_all, is_high, rules_high)
+    format_rules(tech_rules).to_csv(output_dir / "04_technical_rules_low_support.csv", index=False)
+    pairs = technical_pairs(onehot_all, is_high)
+    summary += "\n" + format_low_support_section(itemsets_low, tech_rules, onehot_all, pairs)
     (output_dir / "04_summary.txt").write_text(summary, encoding="utf-8")
     logger.info("Saved rules, network plot, and summary to %s", output_dir)
     return {"rules_all": rules_all, "rules_high": rules_high, "graph": graph, "summary": summary,
-            "itemsets_all": itemsets_all, "itemsets_high": itemsets_high}
+            "itemsets_all": itemsets_all, "itemsets_high": itemsets_high,
+            "itemsets_low": itemsets_low, "tech_rules": tech_rules, "tech_pairs": pairs}
 
 
 if __name__ == "__main__":

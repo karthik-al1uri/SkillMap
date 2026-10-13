@@ -94,7 +94,7 @@ Install all with:
 pip install -r requirements.txt
 ```
 
-Local environment: Homebrew Python blocks `pip install` (PEP 668), so the project uses `.venv/` (gitignored), created with `--system-site-packages`. It reuses the system pandas/numpy/matplotlib/networkx/sklearn and adds mlxtend, ipython, and xgboost. xgboost needs `brew install libomp`. Run pipelines with `.venv/bin/python -m src.<module>`.
+Local environment: Homebrew Python blocks `pip install` (PEP 668), so the project uses `.venv/` (gitignored), created with `--system-site-packages`. It reuses the system pandas/numpy/matplotlib/networkx/sklearn and adds mlxtend, ipython, xgboost, and mord. xgboost needs `brew install libomp`. Run pipelines with `.venv/bin/python -m src.<module>`.
 
 ---
 
@@ -178,6 +178,7 @@ Top states and industries are chosen on the train split only.
   - XGBoost: 0.683 / 0.858
   - LR: 0.632 / 0.815
 - **F1 > 0.75 target not met by any model; AUC target met by all.** The 245-skill vocabulary added ~0.01-0.02 F1 to every model; company TF-IDF added nothing (title-only with 600 trees scored 0.731). Exploration: 2,000 title 1-2 grams reached ~0.74, still short. Errors are almost all at the Mid-tier boundary
+- Ordinal experiment (Models 5-6, `mord`, same base + TF-IDF features as Model 4, standardized): Ordinal Ridge F1 0.607 / AUC 0.817, Logistic IT 0.642 / 0.820. A multinomial LR control on the same features scores 0.667. **Ordinal doesn't help:** Ordinal Ridge's higher Mid F1 (0.559 vs control 0.535) comes from predicting Mid for 57% of jobs. The results CSV has per-tier F1 (`f1_low`/`f1_mid`/`f1_high`)
 - Outputs: `05_classification_results.csv`, `05_best_model.pkl` (dict with model + feature metadata), `05_confusion_matrix.png`, `05_feature_importance.png`, `05_summary.txt`
 
 ### Stage 6 — Clustering (`notebooks/06_clustering.ipynb`, `src/clustering.py`)
@@ -203,7 +204,8 @@ Top states and industries are chosen on the train split only.
   - Data, Tech & Engineering (17%, mean $132k, 64% High)
   - Management & Leadership (31%, mean $101k)
   - Sales, Retail & Customer Service (51%, mean $82k)
-- **Outputs:** `06_cluster_labels.csv`, `06_elbow_plot.png`, `06_kdistance_plot.png`, `06_clusters_pca.png`, `06_cluster_profiles.txt`, `06_summary.txt`
+- **Outlier detection:** Isolation Forest (contamination 0.01, 300 trees) on multi-hot skills + experience ordinal + salary flags 342 jobs → `06_outliers.csv`. The anomaly score is driven by skill count (Spearman 0.95; flagged jobs average 30.8 skills vs 11.5), **not** salary mismatch: 5.6% of flagged jobs have |z| > 2 log-salary within their (cluster, experience) group, vs 4.5% overall. Sensitivity run (skills → SVD(10)): 38% overlap, 9.9% mismatches
+- **Outputs:** `06_cluster_labels.csv`, `06_outliers.csv`, `06_elbow_plot.png`, `06_kdistance_plot.png`, `06_clusters_pca.png`, `06_cluster_profiles.txt`, `06_summary.txt`
 
 ---
 

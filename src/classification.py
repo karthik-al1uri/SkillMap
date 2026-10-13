@@ -1,4 +1,4 @@
-"""SkillMap Stage 5 — salary tier classification (Logistic Regression, Random Forest, XGBoost).
+"""SkillMap Stage 5 — salary tier classification (Logistic Regression, Random Forest, XGBoost, ordinal).
 
 Predicts `salary_tier` (Low / Mid / High) from posting features:
     - matched_skills: multi-hot over the Stage 2 skill vocabulary
@@ -17,6 +17,11 @@ removed; both fit on the training split).
 Its hyperparameters are chosen by 3-fold cross-validated grid search on the training
 split only, so the test set is never used for tuning.
 
+Models 5 and 6 are an ordinal experiment with mord: OrdinalRidge (ridge regression on the
+tier codes, rounded) and LogisticIT (immediate-threshold ordinal logistic regression). They
+use the same base + TF-IDF features as Model 4, standardized. A multinomial Logistic Regression
+on those features is fit as a control, so the ordinal-vs-nominal comparison holds features fixed.
+
 Run from the project root with:
     python -m src.classification
 """
@@ -30,6 +35,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import mord
 import numpy as np
 import pandas as pd
 import scipy.sparse as sp
@@ -58,6 +64,10 @@ COMPANY_TFIDF_MAX_FEATURES = 30
 COMPANY_STOP_WORDS = ["inc", "llc", "corp", "corporation", "co", "company", "ltd", "lp", "llp",
                       "pc", "pllc", "plc", "na", "usa", "us"]
 TITLE_MODEL_NAME = "XGBoost + title & company TF-IDF"
+ORDINAL_RIDGE_NAME = "Ordinal Ridge (mord)"
+LOGISTIC_IT_NAME = "Logistic IT (mord)"
+ORDINAL_CONTROL_NAME = "Logistic Regression + title & company TF-IDF (control)"
+TEXT_FEATURE_MODELS = [TITLE_MODEL_NAME, ORDINAL_RIDGE_NAME, LOGISTIC_IT_NAME]
 # Grid searched for Model 4 with 3-fold CV (macro F1) on the training split.
 TITLE_MODEL_GRID = {
     "max_depth": [4, 6, 8],
@@ -217,15 +227,28 @@ def build_models() -> dict:
     }
 
 
+def class_scores(model, X) -> np.ndarray:
+    """Return an (n, 3) array of per-tier scores for one-vs-rest ROC-AUC.
+
+    Uses predict_proba when the model has it. OrdinalRidge only gives a continuous score s on
+    the 0-2 tier scale, so its tier scores are -s (Low), -|s - 1| (Mid), and s (High).
+    """
+    if hasattr(model, "predict_proba"):
+        return model.predict_proba(X)
+    s = model[:-1].transform(X) @ model[-1].coef_ + model[-1].intercept_
+    return np.column_stack([-s, -np.abs(s - 1), s])
+
+
 def evaluate_model(model, X_train, y_train, X_test, y_test) -> dict:
-    """Score a fitted model: macro F1 (train and test), one-vs-rest macro ROC-AUC, accuracy, confusion matrix."""
-    pred = model.predict(X_test)
-    proba = model.predict_proba(X_test)
+    """Score a fitted model: macro and per-tier F1, one-vs-rest macro ROC-AUC, accuracy, confusion matrix."""
+    pred = np.asarray(model.predict(X_test)).astype(int)
+    scores = class_scores(model, X_test)
     return {
         "f1_macro": f1_score(y_test, pred, average="macro"),
-        "roc_auc_ovr": roc_auc_score(y_test, proba, multi_class="ovr", average="macro"),
+        "f1_per_tier": f1_score(y_test, pred, average=None, labels=[0, 1, 2]),
+        "roc_auc_ovr": np.mean([roc_auc_score(y_test == k, scores[:, k]) for k in range(3)]),
         "accuracy": accuracy_score(y_test, pred),
-        "train_f1_macro": f1_score(y_train, model.predict(X_train), average="macro"),
+        "train_f1_macro": f1_score(y_train, np.asarray(model.predict(X_train)).astype(int), average="macro"),
         "confusion_matrix": confusion_matrix(y_test, pred, labels=[0, 1, 2]),
         "report": classification_report(y_test, pred, target_names=TIER_LABELS, digits=3),
     }
@@ -254,11 +277,42 @@ def train_title_model(A_train, y_train, A_test, y_test) -> tuple:
     return model, metrics, tuning
 
 
+def build_ordinal_models() -> dict:
+    """Return the untrained ordinal models (5 and 6) and the multinomial control, keyed by display name."""
+    return {
+        ORDINAL_RIDGE_NAME: make_pipeline(StandardScaler(), mord.OrdinalRidge(alpha=1.0, random_state=RANDOM_STATE)),
+        LOGISTIC_IT_NAME: make_pipeline(StandardScaler(), mord.LogisticIT(alpha=1.0)),
+        ORDINAL_CONTROL_NAME: make_pipeline(
+            StandardScaler(), LogisticRegression(max_iter=2000, random_state=RANDOM_STATE)),
+    }
+
+
+def train_ordinal_models(A_train, y_train, A_test, y_test) -> tuple:
+    """Fit and evaluate the ordinal models and the control on base + TF-IDF features.
+
+    Returns (fitted models, metrics) for Models 5 and 6, and the control's metrics separately.
+    """
+    A_train, A_test = A_train.toarray(), A_test.toarray()   # mord needs dense input
+    y_train_np, y_test_np = np.asarray(y_train), np.asarray(y_test)
+    models, metrics = build_ordinal_models(), {}
+    for name, model in models.items():
+        model.fit(A_train, y_train_np)
+        metrics[name] = evaluate_model(model, A_train, y_train_np, A_test, y_test_np)
+        logger.info("%s: F1 macro %.3f (Mid %.3f), ROC-AUC %.3f", name, metrics[name]["f1_macro"],
+                    metrics[name]["f1_per_tier"][1], metrics[name]["roc_auc_ovr"])
+    control = metrics.pop(ORDINAL_CONTROL_NAME)
+    models.pop(ORDINAL_CONTROL_NAME)
+    return models, metrics, control
+
+
 def results_table(metrics: dict) -> pd.DataFrame:
     """Return one row per model with the headline metrics, best F1 first."""
     rows = [{"model": name,
-             "features": "base + title & company TF-IDF" if name == TITLE_MODEL_NAME else "base",
+             "features": "base + title & company TF-IDF" if name in TEXT_FEATURE_MODELS else "base",
              "f1_macro": m["f1_macro"],
+             "f1_low": m["f1_per_tier"][0],
+             "f1_mid": m["f1_per_tier"][1],
+             "f1_high": m["f1_per_tier"][2],
              "roc_auc_ovr": m["roc_auc_ovr"],
              "accuracy": m["accuracy"],
              "train_f1_macro": m["train_f1_macro"],
@@ -266,7 +320,7 @@ def results_table(metrics: dict) -> pd.DataFrame:
              "meets_auc_target": m["roc_auc_ovr"] > AUC_TARGET}
             for name, m in metrics.items()]
     table = pd.DataFrame(rows).sort_values(["f1_macro", "roc_auc_ovr"], ascending=False)
-    num = ["f1_macro", "roc_auc_ovr", "accuracy", "train_f1_macro"]
+    num = ["f1_macro", "f1_low", "f1_mid", "f1_high", "roc_auc_ovr", "accuracy", "train_f1_macro"]
     table[num] = table[num].round(4)
     return table.reset_index(drop=True)
 
@@ -281,7 +335,7 @@ def feature_importance(model, feature_names: list) -> pd.Series:
     if hasattr(model, "feature_importances_"):
         values = model.feature_importances_
     else:
-        values = np.abs(model[-1].coef_).mean(axis=0)
+        values = np.abs(np.atleast_2d(model[-1].coef_)).mean(axis=0)
     return pd.Series(values, index=feature_names).sort_values(ascending=False)
 
 
@@ -321,13 +375,15 @@ IMPORTANCE_LABEL = {
     "XGBoost": "Importance (share of total gain)",
     TITLE_MODEL_NAME: "Importance (share of total gain)",
     "Logistic Regression": "Mean |standardized coefficient| across classes",
+    ORDINAL_RIDGE_NAME: "|standardized coefficient|",
+    LOGISTIC_IT_NAME: "|standardized coefficient|",
 }
 
 
 def plot_confusion_matrices(metrics: dict, path: Path) -> None:
     """Save one row-normalized confusion matrix per model, annotated with % and counts."""
     names = list(metrics)
-    ncols = 2 if len(names) == 4 else len(names)
+    ncols = 3 if len(names) > 4 else (2 if len(names) == 4 else len(names))
     nrows = int(np.ceil(len(names) / ncols))
     fig, axes = plt.subplots(nrows, ncols, figsize=(5.4 * ncols, 5 * nrows), dpi=150)
     fig.patch.set_facecolor(SURFACE)
@@ -383,8 +439,11 @@ def save_best_model(model, name: str, feature_names: list, top: dict, skills: li
 
 def build_summary(df: pd.DataFrame, X: pd.DataFrame, n_train: int, n_test: int, top: dict,
                   table: pd.DataFrame, metrics: dict, best: str, importances: pd.Series,
-                  text_words: dict = None, tuning: dict = None) -> str:
-    """Build the plain-text Stage 5 summary."""
+                  text_words: dict = None, tuning: dict = None, ordinal_control: dict = None) -> str:
+    """Build the plain-text Stage 5 summary.
+
+    `ordinal_control` (metrics of the multinomial control) adds the ordinal experiment section.
+    """
     line = "=" * 80
     best_row = table.iloc[0]
     size_counts = (encode_company_size(df["employee_count"]).value_counts().sort_index()
@@ -426,6 +485,8 @@ def build_summary(df: pd.DataFrame, X: pd.DataFrame, n_train: int, n_test: int, 
         metrics[best]["report"],
         "",
     ]
+    if ordinal_control is not None:
+        parts += [format_ordinal_experiment(metrics, ordinal_control), ""]
     for name, m in metrics.items():
         cm = pd.DataFrame(m["confusion_matrix"], index=[f"actual {t}" for t in TIER_LABELS],
                           columns=[f"pred {t}" for t in TIER_LABELS])
@@ -433,6 +494,52 @@ def build_summary(df: pd.DataFrame, X: pd.DataFrame, n_train: int, n_test: int, 
     parts += [f"-- {best}: top 20 features --",
               importances.head(20).round(4).to_string(), ""]
     return "\n".join(parts)
+
+
+def format_ordinal_experiment(metrics: dict, control: dict) -> str:
+    """Compare the ordinal models (5, 6) with Model 4 and the same-feature multinomial control."""
+    line = "=" * 80
+    names = [TITLE_MODEL_NAME, ORDINAL_RIDGE_NAME, LOGISTIC_IT_NAME, "Logistic Regression"]
+    rows = [{"model": n, "f1_macro": metrics[n]["f1_macro"], "f1_mid": metrics[n]["f1_per_tier"][1],
+             "roc_auc_ovr": metrics[n]["roc_auc_ovr"]} for n in names if n in metrics]
+    rows.insert(3, {"model": ORDINAL_CONTROL_NAME, "f1_macro": control["f1_macro"],
+                    "f1_mid": control["f1_per_tier"][1], "roc_auc_ovr": control["roc_auc_ovr"]})
+    table = pd.DataFrame(rows)
+    ordinal = max([ORDINAL_RIDGE_NAME, LOGISTIC_IT_NAME], key=lambda n: metrics[n]["f1_macro"])
+    best_mid = max([ORDINAL_RIDGE_NAME, LOGISTIC_IT_NAME], key=lambda n: metrics[n]["f1_per_tier"][1])
+    o, ref = metrics[ordinal], metrics[TITLE_MODEL_NAME]
+    mid, control_mid, ref_mid = (metrics[best_mid]["f1_per_tier"][1], control["f1_per_tier"][1],
+                                 ref["f1_per_tier"][1])
+    def mid_share(m: dict) -> float:
+        """Share of test jobs predicted Mid."""
+        return m["confusion_matrix"][:, 1].sum() / m["confusion_matrix"].sum()
+
+    actual_mid = control["confusion_matrix"][1].sum() / control["confusion_matrix"].sum()
+    best_mid_macro = metrics[best_mid]["f1_macro"]
+    if mid > control_mid and best_mid_macro >= control["f1_macro"]:
+        verdict = "the ordinal approach helps Mid-tier F1 without lowering macro F1 relative to the control."
+    elif mid > control_mid:
+        verdict = (f"{best_mid} raises Mid-tier F1 by over-predicting Mid, which lowers Low and High F1 "
+                   f"(macro F1 {best_mid_macro - control['f1_macro']:+.3f} vs the control). "
+                   f"The ordinal approach does not help overall.")
+    else:
+        verdict = "the ordinal approach does not help Mid-tier F1."
+    verdict += (f" No ordinal model beats the current best macro F1 ({ref['f1_macro']:.3f})."
+                if o["f1_macro"] <= ref["f1_macro"] else f" {ordinal} beats the current best macro F1.")
+    return "\n".join([
+        f"{line}\nOrdinal experiment (Models 5-6, mord; base + title & company TF-IDF, standardized)\n{line}",
+        "OrdinalRidge ROC-AUC uses tier scores -s, -|s - 1|, s from its continuous output s.",
+        "The control is multinomial Logistic Regression on the same features.",
+        table.round(4).to_string(index=False),
+        "",
+        f"Best ordinal macro F1: {ordinal} {o['f1_macro']:.3f} vs current best {TITLE_MODEL_NAME} "
+        f"{ref['f1_macro']:.3f} ({o['f1_macro'] - ref['f1_macro']:+.3f}).",
+        f"Mid-tier F1: best ordinal ({best_mid}) {mid:.3f} vs nominal control {control_mid:.3f} "
+        f"({mid - control_mid:+.3f}) and {TITLE_MODEL_NAME} {ref_mid:.3f} ({mid - ref_mid:+.3f}).",
+        f"{best_mid} predicts Mid for {mid_share(metrics[best_mid]):.0%} of test jobs (actual "
+        f"{actual_mid:.0%}); the control predicts Mid for {mid_share(control):.0%}.",
+        f"Verdict: {verdict}",
+    ])
 
 
 def run_pipeline(project_root: Path = None) -> dict:
@@ -455,11 +562,14 @@ def run_pipeline(project_root: Path = None) -> dict:
     A_train, A_test, text_names, vectorizers = build_text_features(train_df, test_df, X_train, X_test)
     models[TITLE_MODEL_NAME], metrics[TITLE_MODEL_NAME], tuning = train_title_model(
         A_train, y_train, A_test, y_test)
+    ordinal_models, ordinal_metrics, control = train_ordinal_models(A_train, y_train, A_test, y_test)
+    models.update(ordinal_models)
+    metrics.update(ordinal_metrics)
 
     table = results_table(metrics)
     table.to_csv(output_dir / "05_classification_results.csv", index=False)
     best = table.iloc[0]["model"]
-    uses_text = best == TITLE_MODEL_NAME
+    uses_text = best in TEXT_FEATURE_MODELS
     feature_names = text_names if uses_text else list(X_train.columns)
 
     importances = feature_importance(models[best], feature_names)
@@ -470,13 +580,14 @@ def run_pipeline(project_root: Path = None) -> dict:
 
     text_words = {column: list(v.get_feature_names_out()) for column, v in vectorizers.items()}
     summary = build_summary(df, X_train, len(X_train), len(X_test), top, table, metrics, best, importances,
-                            text_words=text_words, tuning=tuning)
+                            text_words=text_words, tuning=tuning, ordinal_control=control)
     (output_dir / "05_summary.txt").write_text(summary, encoding="utf-8")
     logger.info("Saved %s", output_dir / "05_summary.txt")
     return {"models": models, "metrics": metrics, "table": table, "best": best,
             "importances": importances, "X_train": X_train, "X_test": X_test,
             "y_train": y_train, "y_test": y_test, "top": top, "summary": summary,
-            "A_train": A_train, "A_test": A_test, "text_vectorizers": vectorizers, "tuning": tuning}
+            "A_train": A_train, "A_test": A_test, "text_vectorizers": vectorizers, "tuning": tuning,
+            "ordinal_control": control}
 
 
 if __name__ == "__main__":

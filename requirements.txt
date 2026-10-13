@@ -5,6 +5,7 @@ nltk>=3.8
 mlxtend>=0.23
 scikit-learn>=1.3
 xgboost>=2.0
+mord>=0.7
 networkx>=3.1
 matplotlib>=3.7
 plotly>=5.18

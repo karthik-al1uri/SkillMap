@@ -15,11 +15,13 @@ SkillMap/
 ├── README.md
 ├── requirements.txt
 ├── .gitignore
+├── .env.example          ← template; real credentials go in .env (gitignored, never commit)
 ├── data/
 │   ├── raw/              ← one folder per dataset (see Datasets); gitignored
 │   │   ├── linkedin_jobs/
 │   │   ├── linkedin_postings/
-│   │   └── ds_salaries/
+│   │   ├── ds_salaries/
+│   │   └── adzuna_live/  ← Stage 7 API cache: pages/, raw_jobs.json, live_jobs.csv, api_calls.json
 │   └── processed/        ← pipeline outputs go here; gitignored
 ├── notebooks/
 │   ├── 01_data_ingestion.ipynb
@@ -27,13 +29,15 @@ SkillMap/
 │   ├── 03_data_warehouse.ipynb
 │   ├── 04_association_mining.ipynb
 │   ├── 05_classification.ipynb
-│   └── 06_clustering.ipynb
+│   ├── 06_clustering.ipynb
+│   └── 07_live_pipeline.ipynb
 ├── src/
 │   ├── preprocessing.py
 │   ├── warehouse.py
 │   ├── association.py
 │   ├── classification.py
-│   └── clustering.py
+│   ├── clustering.py
+│   └── live_pipeline.py
 └── outputs/
 ```
 
@@ -94,7 +98,7 @@ Install all with:
 pip install -r requirements.txt
 ```
 
-Local environment: Homebrew Python blocks `pip install` (PEP 668), so the project uses `.venv/` (gitignored), created with `--system-site-packages`. It reuses the system pandas/numpy/matplotlib/networkx/sklearn and adds mlxtend, ipython, xgboost, and mord. xgboost needs `brew install libomp`. Run pipelines with `.venv/bin/python -m src.<module>`.
+Local environment: Homebrew Python blocks `pip install` (PEP 668), so the project uses `.venv/` (gitignored), created with `--system-site-packages`. It reuses the system pandas/numpy/matplotlib/networkx/sklearn and adds mlxtend, ipython, xgboost, and mord (python-dotenv and requests come from the system site-packages). xgboost needs `brew install libomp`. Run pipelines with `.venv/bin/python -m src.<module>`.
 
 ---
 
@@ -208,6 +212,26 @@ Top states and industries are chosen on the train split only.
 - **Outlier detection:** Isolation Forest (contamination 0.01, 300 trees) on multi-hot skills + experience ordinal + salary flags 342 jobs → `06_outliers.csv`. The anomaly score is driven by skill count (Spearman 0.95; flagged jobs average 30.8 skills vs 11.5), **not** salary mismatch: 5.6% of flagged jobs have |z| > 2 log-salary within their (cluster, experience) group, vs 4.5% overall. Sensitivity run (skills → SVD(10)): 38% overlap, 9.9% mismatches
 - **t-SNE** (perplexity 30, `max_iter` 1000, same 8,000-job sample as PCA) → `06_clusters_tsne.png` (2×2: PCA/t-SNE × K-Means cluster/salary tier). kNN overlap with 245-D: t-SNE 18.1% vs PCA 3.0%. Still one mass, no islands. High-tier hotspots (≥ 70% of 30 neighbours High, DBSCAN on t-SNE): software eng. (83% High), product/account roles, and **acute-care nursing (ACLS/BLS/RN, 79% High), 97% of which K-Means puts in the Service cluster**
 - **Outputs:** `06_cluster_labels.csv`, `06_outliers.csv`, `06_clusters_tsne.png`, `06_elbow_plot.png`, `06_kdistance_plot.png`, `06_clusters_pca.png`, `06_cluster_profiles.txt`, `06_summary.txt`
+
+---
+
+### Stage 7 — Live Data Pipeline (`notebooks/07_live_pipeline.ipynb`, `src/live_pipeline.py`)
+**Status: complete (fetched 2026-10-14). The API budget is fully used, so do NOT re-fetch.** Run with `python -m src.live_pipeline` (~5 s, cache only).
+- **Credentials:** from `.env` via python-dotenv. Adzuna needs `app_id` (`ADZUNA_APP_ID`) + `app_key` (`ADZUNA_API_KEY`); an `api_key`-only call returned HTTP 400. Never hardcode or log them. Adzuna puts the app ID in each `redirect_url` (`utm_source`), so pages are scrubbed before they are saved or used
+- **API budget:** 25 calls on the free tier, **all 25 used**: 2 health checks (400, then 200) + 23 pages × 50 = 1,150 unique US `it-jobs` postings
+  - Every call is logged in `data/raw/adzuna_live/api_calls.json` before it is sent, and `api_get` refuses past `CALL_BUDGET`
+  - The health check and pages are cached, so reruns and the notebook make no calls
+- **Preprocessing:** Stage 2 `match_description_skills` + vocabulary. `mean_salary` = (min + max) / 2. Exact training tier thresholds (Low ≤ $62,400, Mid ≤ $109,200). State from `location.area` (90% parsed)
+  - Output: `data/processed/live_cleaned_jobs.csv` (extra columns: `state`, `salary_is_predicted`)
+- **Warehouse:** table `live_job_postings` in `skillmap.db`, same columns and (job, skill) grain as `job_postings`, plus source/fetch_date/has_salary. 2,570 rows, 1,150 jobs. `python -m src.warehouse` rebuilds the db without it
+- **Findings:**
+  - Snippets of about 500 characters give only 2.0 skills per posting (training 11.5)
+  - 1,149 postings have a salary, but **1,092 (95%) are Adzuna estimates** (`salary_is_predicted`)
+  - Live tiers: Low 7% / Mid 31% / High 62% (median $123,689)
+  - Rules: 0 at 0.05 support, 1 at 0.02 (compliance → security). **0 of the 20 training rules reappear**
+  - Stage 5 model: accuracy 0.594, macro F1 0.478, **below the 0.621 majority baseline** (advertised salaries only: 0.509, n = 57)
+  - Conclusion: confirms that IT pays more, but the free Adzuna data (snippets, estimated salaries, no experience/company size/industry) can't validate the rules or the classifier
+- **Outputs:** `07_live_association_rules.csv`, `07_rules_comparison.csv`, `07_live_predictions.csv`, `07_live_summary.txt`
 
 ---
 

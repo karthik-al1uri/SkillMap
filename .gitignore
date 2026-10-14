@@ -8,6 +8,13 @@ outputs/*
 *.csv
 *.json
 
+# Secrets — real API credentials live only in .env (template: .env.example)
+.env
+
+# Stage 7 live Adzuna data (large, re-fetchable only within the API budget)
+data/raw/adzuna_live/raw_jobs.json
+data/raw/adzuna_live/live_jobs.csv
+
 # Python / Jupyter
 __pycache__/
 *.pyc

@@ -21,7 +21,8 @@ SkillMap/
 │   │   ├── linkedin_jobs/
 │   │   ├── linkedin_postings/
 │   │   ├── ds_salaries/
-│   │   └── adzuna_live/  ← Stage 7 API cache: pages/, raw_jobs.json, live_jobs.csv, api_calls.json
+│   │   ├── adzuna_live/  ← Stage 7 API cache: pages/, raw_jobs.json, live_jobs.csv, api_calls.json
+│   │   └── muse_live/    ← Stage 8 API cache: pages/, raw_jobs.json, live_jobs.csv, fetch_log.json
 │   └── processed/        ← pipeline outputs go here; gitignored
 ├── notebooks/
 │   ├── 01_data_ingestion.ipynb
@@ -30,14 +31,16 @@ SkillMap/
 │   ├── 04_association_mining.ipynb
 │   ├── 05_classification.ipynb
 │   ├── 06_clustering.ipynb
-│   └── 07_live_pipeline.ipynb
+│   ├── 07_live_pipeline.ipynb
+│   └── 08_muse_pipeline.ipynb
 ├── src/
 │   ├── preprocessing.py
 │   ├── warehouse.py
 │   ├── association.py
 │   ├── classification.py
 │   ├── clustering.py
-│   └── live_pipeline.py
+│   ├── live_pipeline.py
+│   └── muse_pipeline.py
 └── outputs/
 ```
 
@@ -98,7 +101,7 @@ Install all with:
 pip install -r requirements.txt
 ```
 
-Local environment: Homebrew Python blocks `pip install` (PEP 668), so the project uses `.venv/` (gitignored), created with `--system-site-packages`. It reuses the system pandas/numpy/matplotlib/networkx/sklearn and adds mlxtend, ipython, xgboost, and mord (python-dotenv and requests come from the system site-packages). xgboost needs `brew install libomp`. Run pipelines with `.venv/bin/python -m src.<module>`.
+Local environment: Homebrew Python blocks `pip install` (PEP 668), so the project uses `.venv/` (gitignored), created with `--system-site-packages`. It reuses the system pandas/numpy/matplotlib/networkx/sklearn and adds mlxtend, ipython, xgboost, and mord (python-dotenv, requests, and beautifulsoup4 come from the system site-packages). xgboost needs `brew install libomp`. Run pipelines with `.venv/bin/python -m src.<module>`.
 
 ---
 
@@ -233,10 +236,29 @@ Top states and industries are chosen on the train split only.
   - Conclusion: confirms that IT pays more, but the free Adzuna data (snippets, estimated salaries, no experience/company size/industry) can't validate the rules or the classifier
 - **Outputs:** `07_live_association_rules.csv`, `07_rules_comparison.csv`, `07_live_predictions.csv`, `07_live_summary.txt`
 
+### Stage 8 — The Muse Live Skill Validation (`notebooks/08_muse_pipeline.ipynb`, `src/muse_pipeline.py`)
+**Status: complete (fetched 2026-10-14).** Run with `python -m src.muse_pipeline` (~30 s, cache only). Purpose: Stage 7 snippets (2.0 skills per posting) couldn't test rules; The Muse returns full descriptions.
+- **API:** `https://www.themuse.com/api/public/jobs`, no key
+  - CloudFront returns 403 for generic User-Agents, so requests send `USER_AGENT` ("SkillMap/1.0 (CU Boulder ...)"). Don't spoof a browser
+  - Category names are mapped in `MUSE_CATEGORIES`: Data Science → Data Science (only 2 jobs), Engineering → Software Engineering, IT → Computer and IT, Analytics → Data and Analytics
+  - Results aren't date-sorted (`descending` doesn't help)
+  - Pages are cached in `data/raw/muse_live/pages/`; 76 page calls are logged in `fetch_log.json`
+- **Data:** 1,502 fetched → 1,502 unique ids → **1,378 after dropping 124 reposts** (same company, title, description)
+  - 813 words and **16.2 skills per posting** (Adzuna 71 / 2.0; training 11.5). 73% published in the 90 days before the fetch
+  - **Concentrated:** SpaceX 34%, Bank of America 12%, 115 companies
+  - Levels map per `LEVEL_MAP` (Mid Level → Mid-Senior, Senior Level → Senior, ...). No salary
+- **Outputs:** `data/processed/muse_cleaned_jobs.csv` (extra column `publication_date`) and warehouse table `muse_job_postings` (one row per posting, `matched_skills` as a JSON array)
+- **Rule validation:** Apriori (≥ 2 skills, support 0.05) gives 20,599 rules; the top-lift ones are single-employer template text
+  - **2 of 20 training rules confirmed** (powerpoint → excel; {development, management, organization} → leadership); company-capped at 25 per company: 1 (marketing → sales)
+  - 14 of the 16 failures hit a **lift ceiling** (`muse_max_lift` = 1 / consequent share; development/design/management are in 55-62% of tech postings), and all 14 have *higher* confidence than in training
+  - Takeaway: groupings persist; lift doesn't transfer from all-industry to tech-only
+- **Demand vs training tech cluster:** python 32% vs 18%; sql, c++, ci/cd, kubernetes up; agile 11% vs 17% and aws 7% vs 12% down. Manufacturing/healthcare shifts reflect the employer mix
+- **Outputs:** `08_muse_association_rules.csv`, `08_rules_validation.csv` (rule, training_lift, muse_lift, validated, plus support, confidence, max-lift, and company-capped columns), `08_skill_comparison.csv`, `08_muse_summary.txt`
+
 ---
 
 ### Final Report
-**Status: complete.** `outputs/final_report.md`: paper-style write-up (abstract, dataset, methodology, Q1-Q3 results, discussion, conclusion, IEEE references). It covers the low-support technical rules (Q1), t-SNE and outliers (Q2), and the ordinal negative result (Q3). The references are 10 standard method papers because the proposal isn't in the repo; swap them in if they differ.
+**Status: complete.** `outputs/final_report.md`: paper-style write-up (abstract, dataset, methodology, Q1-Q3 results, discussion, conclusion, IEEE references). It covers the low-support technical rules (Q1), t-SNE and outliers (Q2), the ordinal negative result (Q3), and live validation (Section 4.4: Adzuna + The Muse, both listed in the Section 2 datasets table). The references are 10 standard method papers because the proposal isn't in the repo; swap them in if they differ.
 
 ---
 

@@ -14,6 +14,9 @@ outputs/*
 # Stage 7 live Adzuna data (large, re-fetchable only within the API budget)
 data/raw/adzuna_live/raw_jobs.json
 data/raw/adzuna_live/live_jobs.csv
+# Stage 8 The Muse data
+data/raw/muse_live/raw_jobs.json
+data/raw/muse_live/live_jobs.csv
 
 # Python / Jupyter
 __pycache__/

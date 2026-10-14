@@ -670,7 +670,10 @@ def build_summary(fetch_date: str, health: dict, fetch: dict, counts: dict, live
             f"estimates (salary_is_predicted=1), not advertised pay.",
             metrics["confusion_matrix"].to_string(),
         ]
-    parts += ["", f"{line}\nKey finding\n{line}", key_finding(live, train["salary_tier"], comparison, metrics), ""]
+    parts += ["", f"{line}\nKey finding\n{line}", key_finding(live, train["salary_tier"], comparison, metrics), "",
+              "Follow-up: Stage 8 (src/muse_pipeline.py, outputs/08_muse_summary.txt) addresses the truncation "
+              "limitation with full-length The Muse descriptions (about 800 words and 16 skills per posting) to "
+              "re-test the association rules.", ""]
     return "\n".join(parts)
 
 

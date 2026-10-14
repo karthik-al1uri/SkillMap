@@ -5,7 +5,7 @@
 
 ## Abstract
 
-We mine 34,179 salaried U.S. LinkedIn postings, using a 245-skill vocabulary built from 1.3 million skill lists, to ask which skills co-occur and predict pay, whether role archetypes exist beyond titles, and whether salary tier is predictable. Apriori finds 91 rules (lift up to 5.54). Technical combinations such as {computer science, design, engineering} are 83% High-tier, 2.5× the baseline. Clustering finds only a weak continuum (silhouette ≤ 0.21), yet it separates a technical profile earning $50k more than service roles. t-SNE finds small well-paid pockets that the partition misses, such as acute-care nursing. Isolation Forest outliers turn out to be skill-dense postings, not salary mismatches. Tuned XGBoost reaches ROC-AUC 0.891 but macro F1 0.728, short of the 0.75 target. Ordinal models do not close the gap.
+We mine 34,179 salaried U.S. LinkedIn postings, using a 245-skill vocabulary built from 1.3 million skill lists, to ask which skills co-occur and predict pay, whether role archetypes exist beyond titles, and whether salary tier is predictable. Apriori finds 91 rules (lift up to 5.54). Technical combinations such as {computer science, design, engineering} are 83% High-tier, 2.5× the baseline. Clustering finds only a weak continuum (silhouette ≤ 0.21), yet it separates a technical profile earning $50k more than service roles. t-SNE finds small well-paid pockets that the partition misses, such as acute-care nursing. Isolation Forest outliers turn out to be skill-dense postings, not salary mismatches. Tuned XGBoost reaches ROC-AUC 0.891 but macro F1 0.728, short of the 0.75 target. Ordinal models do not close the gap. On 1,378 current (2026) tech postings from The Muse, only 2 of the 20 top rules are confirmed. Most of the rest fail because of a base-rate ceiling on lift, while their confidence rises.
 
 ## 1. Introduction
 
@@ -23,13 +23,15 @@ SkillMap is an end-to-end pipeline that goes from raw job postings to a data war
 
 ## 2. Dataset
 
-Three public Kaggle datasets are used:
+Three public Kaggle datasets are used for training and analysis. Two live APIs are used to validate the results on current postings:
 
 | Dataset | Size | Key fields | Role in SkillMap |
 |---|---|---|---|
 | **LinkedIn Job Postings 2023-2024** (arshkon) | 123,849 postings, 11 linked tables | title, description, `normalized_salary`, `pay_period`, `formatted_experience_level`, location, company, industries, 35 job-function skill categories | Main analysis table |
 | **1.3M LinkedIn Jobs & Skills 2024** (asaniczka) | 1.29M postings with skill lists (396 MB postings, 642 MB skills, 4.8 GB summaries) | `job_link`, `job_skills` (comma-separated), title, level | Source of the skill vocabulary (no salaries) |
 | **Data Science Salaries 2020-2025** (arnabchaki) | 93,597 rows (83,997 U.S. full-time) | `salary_in_usd`, `experience_level`, `job_title`, `remote_ratio`, `company_size` | External salary benchmark |
+| **Adzuna API** (live, fetched 2026-10-14) | 1,150 US IT postings (25-call free tier) | title, company, location, `salary_min/max` (95% Adzuna-estimated), ~500-character description snippet | Live check (Stage 7); snippets too short for skill rules |
+| **The Muse API** (live, fetched 2026-10-14) | 1,378 unique postings in Software Engineering, Computer and IT, Data and Analytics, and Data Science (no API key) | title, company, locations, levels, categories, **full HTML description** (~810 words), publication date; no salary | **Validation source** for skill co-occurrence and demand (Stage 8) |
 
 **Preprocessing decisions (Stage 2):**
 
@@ -62,6 +64,8 @@ Three public Kaggle datasets are used:
 | 4. Association mining | Apriori [1] (min support 0.05; confidence > 0.5; lift > 1.5) on all jobs and on High-tier jobs. NetworkX co-occurrence graph. A second pass at min support 0.02 keeps rules that involve one of the 50 technical skills | Apriori is the standard, interpretable way to mine frequent itemsets. Lift controls for skills that are common everywhere. For each High-tier rule, *high-tier lift* = the High share among **all** jobs with that skill combination ÷ 33.3%. It tests whether a combination actually predicts pay |
 | 5. Classification | Features: 245 multi-hot skills, number of matched skills, experience level (ordinal), company size (ordinal, 9 buckets), top-20 states, and top-15 industries. Four models: Logistic Regression (baseline), Random Forest [2], XGBoost [3], and XGBoost + TF-IDF of the top 50 title words and top 30 company-name words. Model 4 is tuned by a 3-fold CV grid search on the training data only (max depth {4, 6, 8} × trees {200, 400} × learning rate {0.05, 0.1} × subsample {0.8, 1.0}). Ordinal experiment: Models 5-6 are Ordinal Ridge and Logistic IT [10] (`mord`) on Model 4's features, standardized, with a same-feature multinomial Logistic Regression as a control. 80/20 stratified split, `random_state=42` | Linear baseline → bagged trees → boosted trees shows how much non-linear interaction helps. Ordinal models use the Low < Mid < High order, which could reduce Mid-tier errors. Macro F1 and one-vs-rest ROC-AUC treat the three balanced classes equally |
 | 6. Clustering | K-Means [4] (k = 3–10, chosen by silhouette, with an elbow check) and DBSCAN [5] (min_samples 20, eps chosen from the k-distance graph). Scored with silhouette [6] and Davies-Bouldin [7]. Clusters named from skills over-represented in them (lift). t-SNE [9] (perplexity 30, 1,000 iterations) on an 8,000-job sample, compared with PCA. **Outlier detection:** Isolation Forest [8] (300 trees, contamination 0.01) on the 245 skill columns + experience level (ordinal) + `normalized_salary`. To test whether outliers are salary mismatches, each job's log salary is z-scored within its (K-Means cluster, experience level) group; \|z\| > 2 counts as a mismatch | K-Means tests whether the data splits into a few compact archetypes. DBSCAN tests for dense groups of arbitrary shape and lets outliers be labelled as noise. t-SNE keeps local neighbourhoods that a linear projection loses. Isolation Forest isolates unusual postings without assuming a distribution, and needs no feature scaling |
+
+| 7-8. Live validation | Adzuna (Stage 7) and The Muse (Stage 8) postings run through the same skill matcher and tier thresholds and loaded into warehouse tables (`live_job_postings`, `muse_job_postings`). Muse rules are mined with the same Apriori settings (postings with ≥ 2 skills), each training rule is checked against them, and the check is repeated with at most 25 postings per company | Tests whether patterns learned from 2023-2024 data hold on current postings from an independent source. The company cap stops a few large employers' template text from driving the result |
 
 **Leakage controls.**
 - Everything learned from data (top states and industries, TF-IDF vocabularies, hyperparameters) is fit on the training split only.
@@ -209,6 +213,50 @@ The company-name words turned out to be generic ("america", "bank", "health", "g
 - A single linear score with two cut points cannot place Mid jobs better. Mid postings differ from Low and High in *which* skills and title words they contain, not in more or less of one ordered signal.
 - Ordinal Ridge has no class probabilities. Its ROC-AUC uses the continuous output *s* as tier scores −*s*, −\|*s* − 1\|, and *s*.
 
+### 4.4 Live Skill Validation
+
+**Why two live sources.** Adzuna (Stage 7) returned 1,150 current IT postings, but its descriptions are ~500-character snippets (71 words). That gave 2.0 skills per posting, too few to mine rules: none of the 20 training rules reappeared, and the salary model scored 59%, below a 62% majority baseline, on mostly Adzuna-estimated salaries. The Muse returns full descriptions.
+
+| Source | Postings | Description length | Skills per posting |
+|---|---|---|---|
+| Training (LinkedIn 2023-2024, all industries) | 34,179 | full | 11.5 |
+| Adzuna (Oct 2026, IT) | 1,150 | 71 words | 2.0 |
+| **The Muse (Oct 2026, tech)** | **1,378** | **813 words** | **16.2** |
+
+**The Muse sample.**
+- 1,502 postings were fetched (76 page calls); 124 reposted duplicates were removed.
+- 73% were published in the 90 days before the fetch.
+- Levels: Senior 57%, Mid-Senior 41%.
+- The sample is **concentrated**: SpaceX supplies 34% of postings and Bank of America 12%, out of 115 companies.
+- The requested "Data Science" category holds only 2 jobs on The Muse, so the tech categories that exist were used.
+
+**Rule validation.** Apriori on the 1,372 postings with ≥ 2 skills (min support 0.05) gives 20,599 rules. The highest-lift ones are long itemsets from a single employer's template text. **2 of the 20 training rules are confirmed** as Muse rules: *powerpoint → excel* (lift 5.42 → 5.83) and *{development, management, organization} → leadership* (2.17 → 1.58). With at most 25 postings per company, only *marketing → sales* passes.
+
+Most failures are a **base-rate ceiling**, not a broken pattern. If a consequent appears in a share *p* of postings, lift can be at most 1/*p*. In tech postings, development (61%), design (62%), and management (55%) are so common that lift is capped at about 1.6-1.8:
+
+| Training rule | Lift (train → Muse) | Max possible Muse lift | Confidence (train → Muse) |
+|---|---|---|---|
+| engineering → design | 2.64 → 1.14 | 1.60 | 0.55 → **0.71** |
+| {development, engineering} → design | 3.02 → 1.28 | 1.60 | 0.63 → **0.80** |
+| {education, leadership} → development | 1.69 → 1.37 | 1.63 | 0.62 → **0.84** |
+| {compliance, leadership} → management | 1.69 → 1.49 | 1.82 | 0.76 → **0.81** |
+| accounting → finance | 5.54 → 6.53 | 8.47 | 0.56 → 0.77 (support 3.4% < 5%) |
+
+14 of the 16 rules that fail the lift test hit this ceiling, and **all 14 have higher confidence on Muse than in training**. *accounting ↔ finance* and *marketing → sales* keep high lift (5.8-6.5), but fall below 5% support in a tech sample.
+
+**Skill demand vs training tech jobs** (the Stage 6 *Data, Tech & Engineering* cluster):
+
+| Skill | Muse 2026 | Training tech 2023-24 | Change |
+|---|---|---|---|
+| python | 31.8% | 17.6% | **+14.2 pp** |
+| sql | 21.3% | 15.0% | +6.3 pp |
+| c++ / ci/cd / kubernetes | 11.6% / 10.9% / 8.2% | 5.8% / 7.2% / 4.9% | +3 to +6 pp |
+| agile | 10.5% | 17.2% | **−6.7 pp** |
+| aws | 7.4% | 11.7% | −4.3 pp |
+| design / development | 62.2% / 61.0% | 79.7% / 74.1% | −17.5 / −13.1 pp |
+
+Manufacturing (+14.8 pp) and healthcare (−9.2 pp) also shift, but they mirror the employer mix (SpaceX, Jabil) rather than the market. All shifts mix real change with source differences, so they are indicative.
+
 ## 5. Discussion
 
 **What this means for job seekers.**
@@ -235,6 +283,12 @@ The company-name words turned out to be generic ("america", "bank", "health", "g
   - Skill counts partly reflect how verbose a description is, not only what the job needs. Normalizing for description length, or capping skills per job, would make clustering and classification less sensitive to boilerplate-heavy ads.
   - Finding salary anomalies directly needs a salary model: flag large residuals from a regression of salary on skills and seniority, rather than running a general-purpose detector on the joint feature space.
 
+**What cross-source validation found.**
+- **Snippets can't validate skill patterns.** Adzuna's 71-word snippets gave 2 skills per posting, so neither rules nor the classifier could be tested. Full descriptions (The Muse, 813 words) gave 16 skills per posting, more than the training data.
+- **Skill groupings persist, but lift doesn't transfer across samples.** The training rules were mined on all industries, where *design* or *development* appear in about 20-37% of jobs. In a tech-only sample those skills are in about 60% of postings, so the same co-occurrence yields a much lower lift. Confidence, the share of postings with A that also list B, rose for 14 of the 16 failing rules. Lift is a property of the pattern *and* the population, so a validation sample needs a similar industry mix, or base-rate-robust measures such as confidence or leverage.
+- **Employer concentration is a hazard for live data.** One employer supplied a third of The Muse sample, and one employer's template produced the top Muse rules. The training data's breadth (thousands of companies) protects against this. A live validation set should be capped per company or weighted by company.
+- **Demand moved toward Python and infrastructure.** In tech postings Python nearly doubled, with SQL, C++, CI/CD, and Kubernetes up and Agile and AWS down. This fits the High-tier technical combinations in Q1 (python + engineering, aws + python) staying relevant in 2026. The direction is suggestive given the sample's concentration.
+
 **What the larger technical vocabulary changed.**
 - Expanding from 100 to 245 skills raised skills per job from 8.2 to 11.5.
 - It improved every classifier by 0.01–0.02 F1 and almost doubled K-Means silhouette (0.031 → 0.056).
@@ -260,12 +314,20 @@ The company-name words turned out to be generic ("america", "bank", "health", "g
 - Its macro F1 is 0.728, short of the 0.75 target, because the Mid-tier boundary is not identifiable from posting text.
 - Ordinal models (Ordinal Ridge 0.607, Logistic IT 0.642) do not help. Both trail an unordered linear control (0.667).
 
+**Live validation (Oct 2026).**
+- On full-length Muse tech postings, 2 of 20 training rules are confirmed as rules (*powerpoint → excel*, *{development, management, organization} → leadership*), or 1 of 20 when capped per company.
+- Most of the rest still co-occur with higher confidence but hit a lift ceiling, because their consequents are near-universal in tech postings. The skill groupings hold; lift-based rules do not transfer from an all-industry to a tech-only population.
+- Python demand in tech postings rose from 18% to 32%.
+- Adzuna snippets were too short to test rules, and the salary model was not validated on live data (Adzuna's salaries are mostly its own estimates).
+
 **Future work.**
 1. Predict salary with regression, then bin the prediction into tiers. Linear ordinal classifiers were tried and did not help (Section 4, Q3). A non-linear ordinal model, such as gradient boosting with cumulative-logit loss, remains untested. Regression residuals would also give a direct way to detect salary anomalies.
 2. Use richer text features from job descriptions, such as sentence embeddings, after removing any stated salary figures.
 3. Adjust salaries for metro-level cost of living, and add company-level pay history.
 4. Extract skills with domain-specific vocabularies or NER models for healthcare and the trades.
 5. Use soft or overlapping clustering (topic models, Gaussian mixtures) to describe the skill continuum better than hard partitions do.
+6. Re-run live validation on a source with an industry mix like the training data's, and full descriptions and advertised salaries. Compare base-rate-robust measures (confidence, leverage, conviction) alongside lift, and cap or weight postings per company.
+7. Collect live postings over several months to track skill demand over time, instead of a single snapshot.
 
 ## References
 

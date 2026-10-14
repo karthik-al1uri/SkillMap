@@ -11,5 +11,6 @@ matplotlib>=3.7
 plotly>=5.18
 python-dotenv>=1.0
 requests>=2.31
+beautifulsoup4>=4.12
 jupyter>=1.0
 ipykernel>=6.25

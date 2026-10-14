@@ -9,5 +9,7 @@ mord>=0.7
 networkx>=3.1
 matplotlib>=3.7
 plotly>=5.18
+python-dotenv>=1.0
+requests>=2.31
 jupyter>=1.0
 ipykernel>=6.25

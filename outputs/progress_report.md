@@ -1,46 +1,46 @@
 ## SkillMap Progress Report
-**Last Updated:** 2026-10-13 00:45 MDT
-**Current Stage:** All improvements complete — low-support mining, t-SNE, final report updated
+**Last Updated:** 2026-10-14 12:45 MDT
+**Current Stage:** Stage 7 — Live Data Pipeline (Adzuna API)
 
 ### ✅ Completed Stages
 - Stage 1 — Ingestion: notebook loads and profiles all 15 raw tables across the 3 datasets → `outputs/01_summary.txt`
-- Stage 2 — Preprocessing: joined, cleaned, deduplicated, salary-tiered postings, with a 245-skill description vocabulary (top 200 + 50 forced technical skills) → `data/processed/cleaned_jobs.csv`
+- Stage 2 — Preprocessing: joined, cleaned, deduplicated, salary-tiered postings, with a 245-skill description vocabulary → `data/processed/cleaned_jobs.csv`
 - Stage 3 — Warehousing: SQLite star schema (449,665 fact rows) with 3 OLAP queries → `data/processed/skillmap.db`
-- Stage 4 — Association Mining: 91 rules on all jobs (top lift 5.54), 277 on High-tier jobs, a co-occurrence network, and a 0.02-support pass for technical rules → `outputs/04_association_rules.csv`, `outputs/04_technical_rules_low_support.csv`
-- Stage 5 — Classification: 6 models. Best is tuned XGBoost + title & company TF-IDF (F1 0.728, AUC 0.891); the ordinal models don't help → `outputs/05_best_model.pkl`
-- Stage 6 — Clustering: K-Means (k=3), DBSCAN, t-SNE vs PCA, and Isolation Forest outliers → `outputs/06_cluster_labels.csv`, `outputs/06_clusters_tsne.png`, `outputs/06_outliers.csv`
-- Final report: covers every result, including the low-support rules, t-SNE, outliers, and the ordinal negative result → `outputs/final_report.md`
+- Stage 4 — Association Mining: 91 rules on all jobs, 277 on High-tier jobs, a co-occurrence network, and a 0.02-support technical pass → `outputs/04_association_rules.csv`
+- Stage 5 — Classification: 6 models. Best is tuned XGBoost + title & company TF-IDF (F1 0.728, AUC 0.891) → `outputs/05_best_model.pkl`
+- Stage 6 — Clustering: K-Means, DBSCAN, t-SNE vs PCA, and Isolation Forest outliers → `outputs/06_cluster_labels.csv`
+- Stage 7 — Live Data: 1,150 current Adzuna IT postings, preprocessed and warehoused, and tested against the Stage 4 rules and the Stage 5 model → `outputs/07_live_summary.txt`
+- Final report → `outputs/final_report.md` (does not yet cover Stage 7)
 
 ### 🔄 Current Stage Summary
 **What was built:**
-- **Stage 4 low-support pass.** All jobs are re-mined at min_support 0.02, keeping rules with a technical skill. Each rule gets High-tier scores and flags for whether it is new (support < 0.05) and whether it already appears in the High-tier rules. The most common technical–technical pairs are listed separately.
-- **Stage 6 t-SNE.** t-SNE runs on the same 8,000-job sample as PCA and is plotted 2×2 against it. The views are compared by kNN overlap and purity, and High-tier hotspots are found with DBSCAN on the t-SNE coordinates.
-- **Final report.**
-  - Methodology adds Isolation Forest, t-SNE, the ordinal models, and the 0.02 pass.
-  - Q1 adds the technical rules, Q2 adds t-SNE and outliers, and Q3 adds the ordinal negative result.
-  - The Discussion has a new outlier section. The abstract and conclusion are updated, and three references are added.
-  - The old future-work item 6 (outlier detection) is removed, and item 1 now records that ordinal was tried.
+- **`src/live_pipeline.py`** loads credentials from `.env`, then:
+  - runs a one-call health check, then fetches IT postings under a hard 25-call budget (every call is logged before it is sent)
+  - caches every response, so reruns make no calls
+  - extracts skills with the Stage 2 matcher and tiers salaries with the exact training thresholds
+  - loads `live_job_postings` into the warehouse, mines rules, and compares them with training
+  - scores the saved Stage 5 model on live salaries
+- **`notebooks/07_live_pipeline.ipynb`** runs Steps 1-7 from the cache.
 
 **Key outputs:**
-- New: `outputs/04_technical_rules_low_support.csv`, `outputs/06_clusters_tsne.png`
-- Updated: `04_summary.txt`, `06_summary.txt`, `final_report.md`
-- Re-executed: notebooks 04 and 06 (notebook 04's stale Findings numbers also fixed)
+- `data/raw/adzuna_live/` (raw_jobs.json, live_jobs.csv, pages/, api_calls.json)
+- `data/processed/live_cleaned_jobs.csv`
+- `skillmap.db` table `live_job_postings`
+- `outputs/07_live_association_rules.csv`, `07_rules_comparison.csv`, `07_live_predictions.csv`, `07_live_summary.txt`
 
-**Rows/records processed:** 34,179 transactions (2,444 frequent itemsets at 0.02 support, 1,421 rules, 10 technical); 8,000-job t-SNE sample
+**Rows/records processed:** 1,150 unique postings (25 of 25 API calls: 2 health checks + 23 pages of 50); 2,570 warehouse rows; 1,149 postings with salary
 
 **Issues found:**
-- **0.02 support is still too high for most technical skills.**
-  - Only agile, sql, python, aws, and azure reach 2%.
-  - All 10 technical rules are new, but each pairs one of those skills with engineering, design, or development.
-  - Three are new high-pay combinations not already in the High-tier rules: python+development (78% High), sql+design (71%), and sql+development (66%).
-  - Technical–technical pairs stay below 2% (python+sql 1.5%) but are the best paid: aws+python 88% High, ML+python 85%.
-- **t-SNE finds no hidden clusters, but it does find local structure PCA misses.**
-  - It keeps 18.1% of each job's true neighbours vs 3.0% for PCA.
-  - It shows High-tier pockets, notably acute-care nursing (79% High), which K-Means puts in the low-paid Service cluster.
-- Targets unchanged: F1 0.728 < 0.75 and silhouette 0.214 < 0.50 are still not met.
+- **Authentication.** Adzuna needs `app_id` + `app_key`. The specified `api_key`-only call returned HTTP 400, which cost 1 call, so 23 pages were fetched instead of 24.
+- **Salaries are mostly estimates.** 1,092 of 1,149 (95%) are Adzuna's own estimates (`salary_is_predicted=1`); only 57 are advertised.
+- **Descriptions are snippets** of about 500 characters: 2.0 skills per posting vs 11.5 in training.
+- **Rules don't transfer.** There are no rules at 0.05 support and one at 0.02 (compliance → security). 0 of the 20 training rules reappear.
+- **The model falls below baseline.** Accuracy is 0.594 and macro F1 0.478, below the 0.621 "always High" baseline. Experience level, company size, and industry are unavailable.
+- **Pay holds up.** Live IT postings are 62% High tier (median $123,689 vs $82,500), which agrees with the training finding that technical roles pay more.
+- **Credential exposure, now fixed.** Adzuna embeds the app ID in each `redirect_url`. Cached pages and outputs are now scrubbed, and a scan finds no credential in any saved file or notebook.
 
 ### ⏭ Next Stage
-**Project complete.** Optional extensions: salary regression with residual-based anomaly detection, and association mining restricted to technical postings (to get tech–tech rules).
+**No API budget remains.** Optional: add a Stage 7 section to `final_report.md`. A meaningful live validation would need a source with full descriptions and advertised salaries.
 
 ### 📊 Pipeline Health
 | Stage | Status | Output File |
@@ -48,7 +48,8 @@
 | Stage 1 — Ingestion | ✅ Complete | outputs/01_summary.txt |
 | Stage 2 — Preprocessing | ✅ Complete | data/processed/cleaned_jobs.csv |
 | Stage 3 — Warehousing | ✅ Complete | data/processed/skillmap.db |
-| Stage 4 — Association Mining | ✅ Complete (incl. 0.02 technical pass) | outputs/04_association_rules.csv, outputs/04_technical_rules_low_support.csv |
-| Stage 5 — Classification | ✅ Complete (AUC met; F1 0.728 < 0.75; ordinal didn't help) | outputs/05_best_model.pkl |
-| Stage 6 — Clustering | ✅ Complete (DB met by DBSCAN; silhouette not met; t-SNE + outliers done) | outputs/06_cluster_labels.csv, outputs/06_clusters_tsne.png, outputs/06_outliers.csv |
-| Final report | ✅ Complete (updated) | outputs/final_report.md |
+| Stage 4 — Association Mining | ✅ Complete | outputs/04_association_rules.csv |
+| Stage 5 — Classification | ✅ Complete (AUC met; F1 0.728 < 0.75) | outputs/05_best_model.pkl |
+| Stage 6 — Clustering | ✅ Complete (silhouette not met) | outputs/06_cluster_labels.csv |
+| Stage 7 — Live Data | ✅ Complete (API budget used: 25/25) | outputs/07_live_summary.txt |
+| Final report | ⚠️ Stage 7 not yet included | outputs/final_report.md |

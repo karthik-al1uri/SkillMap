@@ -68,7 +68,6 @@ ORDINAL_RIDGE_NAME = "Ordinal Ridge (mord)"
 LOGISTIC_IT_NAME = "Logistic IT (mord)"
 ORDINAL_CONTROL_NAME = "Logistic Regression + title & company TF-IDF (control)"
 TEXT_FEATURE_MODELS = [TITLE_MODEL_NAME, ORDINAL_RIDGE_NAME, LOGISTIC_IT_NAME]
-# Grid searched for Model 4 with 3-fold CV (macro F1) on the training split.
 TITLE_MODEL_GRID = {
     "max_depth": [4, 6, 8],
     "n_estimators": [200, 400],
@@ -85,8 +84,8 @@ TIER_TO_CODE = {label: code for code, label in enumerate(TIER_LABELS)}
 EXPERIENCE_TO_CODE = {
     "Internship": 0,
     "Entry level": 1,
-    "Associate": 2,          # Mid
-    "Mid-Senior level": 3,   # Senior
+    "Associate": 2,
+    "Mid-Senior level": 3,
     "Director": 4,
     "Executive": 5,
     "Unknown": -1,
@@ -97,7 +96,6 @@ COMPANY_SIZE_BINS = [0, 10, 50, 200, 500, 1000, 5000, 10000, np.inf]
 COMPANY_SIZE_LABELS = ["unknown", "1-10", "11-50", "51-200", "201-500", "501-1000",
                        "1001-5000", "5001-10000", "10001+"]
 
-# Chart styling: light surface, text inks, one bar hue, blue sequential ramp for heatmaps.
 SURFACE = "#fcfcfb"
 TEXT_PRIMARY = "#0b0b0b"
 TEXT_SECONDARY = "#52514e"

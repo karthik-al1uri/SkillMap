@@ -36,11 +36,14 @@ from dotenv import load_dotenv
 from sklearn.metrics import accuracy_score, confusion_matrix, f1_score
 
 from src import association as assoc
+from src.association import rule_key, rule_metrics
 from src import classification as cl
 from src.preprocessing import find_project_root, load_cleaned_jobs, match_description_skills
 from src.warehouse import STATE_CODES, US_STATES
 
 logger = logging.getLogger(__name__)
+# urllib3 logs full request URLs at DEBUG level, and Adzuna takes app_id/app_key as query parameters.
+logging.getLogger("urllib3").setLevel(logging.WARNING)
 
 load_dotenv()
 API_KEY = os.getenv("ADZUNA_API_KEY")
@@ -405,29 +408,6 @@ def load_into_warehouse(live: pd.DataFrame, db_path: Path) -> dict:
               "jobs_matched_company": matched_companies}
     logger.info("live_job_postings: %d rows (%d jobs), %d jobs with salary", n_rows, n_jobs, result["jobs_with_salary"])
     return result
-
-
-def rule_key(antecedents: str, consequents: str) -> str:
-    """Return a canonical 'a, b -> c' key for a rule given format_rules-style item strings."""
-    return f"{antecedents} -> {consequents}"
-
-
-def rule_metrics(onehot: pd.DataFrame, antecedents: str, consequents: str) -> dict:
-    """Compute support, confidence, and lift of a rule directly on a one-hot transaction matrix.
-
-    Returns NaNs if a skill is absent from the matrix.
-    """
-    ante = [s.strip() for s in antecedents.split(",")]
-    cons = [s.strip() for s in consequents.split(",")]
-    if any(s not in onehot.columns for s in ante + cons):
-        return {"support": np.nan, "confidence": np.nan, "lift": np.nan}
-    a = onehot[ante].all(axis=1)
-    both = a & onehot[cons].all(axis=1)
-    support = both.mean()
-    confidence = both.sum() / a.sum() if a.any() else np.nan
-    cons_support = onehot[cons].all(axis=1).mean()
-    return {"support": support, "confidence": confidence,
-            "lift": confidence / cons_support if cons_support else np.nan}
 
 
 def mine_live_rules(live: pd.DataFrame) -> tuple:

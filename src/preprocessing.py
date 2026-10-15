@@ -25,7 +25,6 @@ logger = logging.getLogger(__name__)
 
 RANDOM_STATE = 42
 
-# Multipliers that convert a pay_period amount to an annual amount.
 # Matches how the dataset's own `normalized_salary` column is computed.
 PAY_PERIOD_TO_ANNUAL = {
     "HOURLY": 2080,
@@ -40,28 +39,20 @@ PAY_PERIOD_TO_ANNUAL = {
 MIN_PLAUSIBLE_SALARY = 10_000
 MAX_PLAUSIBLE_SALARY = 1_000_000
 
-# Size of the skill vocabulary taken from linkedin_jobs_skills for description matching.
 TOP_N_SKILLS = 200
 
 # Technical skills always added to the vocabulary, whatever their frequency in linkedin_jobs.
 FORCED_SKILLS = [
-    # Languages
     "python", "sql", "java", "javascript", "r", "scala", "c++", "go", "rust", "kotlin",
     "swift", "bash", "typescript",
-    # ML / AI
     "machine learning", "deep learning", "tensorflow", "pytorch", "scikit-learn", "nlp",
     "computer vision", "llm", "transformers",
-    # Data
     "spark", "hadoop", "kafka", "airflow", "dbt", "pandas", "numpy", "tableau", "power bi", "looker",
-    # Cloud
     "aws", "azure", "gcp", "docker", "kubernetes", "terraform", "ci/cd",
-    # Databases
     "postgresql", "mysql", "mongodb", "redis", "snowflake", "bigquery",
-    # Other
     "git", "linux", "rest api", "agile", "scrum",
 ]
 
-# Extra spellings searched for a skill, on top of the variants found in linkedin_jobs.
 EXTRA_SKILL_FORMS = {
     "go": ["golang"],
     "nlp": ["natural language processing"],
@@ -124,7 +115,6 @@ SKILL_PATTERNS = {
 }
 
 # Frequent linkedin_jobs "skills" that are benefits or legal boilerplate, not skills.
-# Excluded before taking the top N. Empty this set to keep them.
 EXCLUDED_TERMS = {
     "paid time off", "401k", "life insurance", "dental insurance", "vision insurance",
     "health insurance", "equal opportunity employer",
@@ -140,7 +130,7 @@ EXCLUDED_TERMS = {
     "word", "outlook",
 }
 
-# Near-duplicate skills merged into one canonical skill (variant -> canonical).
+# Merged so near-duplicates do not produce trivial rules such as communication skills -> communication.
 SKILL_SYNONYMS = {
     "communication skills": "communication",
     "leadership skills": "leadership",
@@ -180,7 +170,6 @@ DUPLICATE_POSTING_KEYS = ["company_name", "title", "description", "normalized_sa
 
 SALARY_COLUMNS = ["min_salary", "max_salary", "med_salary", "pay_period", "currency"]
 
-# ds_salaries experience codes mapped to LinkedIn's formatted_experience_level.
 DS_EXPERIENCE_MAP = {
     "EN": "Entry level",
     "MI": "Associate",

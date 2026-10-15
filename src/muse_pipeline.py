@@ -7,6 +7,8 @@ them into the warehouse, checks which Stage 4 association rules still hold, and 
 demand with the 2023-2024 training data.
 
 API notes (found when probing the API on 2026-10-14):
+  - Network errors and HTTP 429/5xx are retried with exponential backoff (honouring
+    Retry-After); a category stops, keeping its cached pages, if a page still fails.
   - CloudFront blocks generic client User-Agents (HTTP 403), so requests send a descriptive
     USER_AGENT that identifies the project.
   - The Muse category names differ from the requested ones; MUSE_CATEGORIES maps them.
@@ -39,7 +41,7 @@ import requests
 from bs4 import BeautifulSoup
 
 from src import association as assoc
-from src.live_pipeline import rule_key, rule_metrics
+from src.association import rule_key, rule_metrics
 from src.preprocessing import FORCED_SKILLS, find_project_root, load_cleaned_jobs, match_description_skills
 from src.warehouse import STATE_CODES, US_STATES
 
@@ -47,19 +49,20 @@ logger = logging.getLogger(__name__)
 
 API_URL = "https://www.themuse.com/api/public/jobs"
 USER_AGENT = "SkillMap/1.0 (CU Boulder data mining course project)"
-# Requested category -> The Muse category name.
 MUSE_CATEGORIES = {
     "Data Science": "Data Science",
     "Engineering": "Software Engineering",
     "IT": "Computer and IT",
     "Analytics": "Data and Analytics",
 }
-PAGES = range(0, 25)              # 25 pages x 20 jobs per category
+PAGES = range(0, 25)
 SLEEP_SECONDS = 0.5
 REQUEST_TIMEOUT = 30
+MAX_ATTEMPTS = 4
+BACKOFF_SECONDS = 2.0
+RETRY_STATUSES = {429, 500, 502, 503, 504}
 SOURCE = "muse_live"
 
-# The Muse level name -> experience_level (as specified for Stage 8).
 LEVEL_MAP = {
     "Internship": "Internship",
     "Entry Level": "Entry",
@@ -77,7 +80,7 @@ MIN_RULES = 10
 TOP_SKILLS = 20
 TOP_SHIFTS = 3
 TECHNICAL_SKILLS = set(FORCED_SKILLS)
-DUPLICATE_KEYS = ["company", "name", "description"]   # Stage 2 used company, title, description, salary
+DUPLICATE_KEYS = ["company", "name", "description"]   # Stage 2 also keyed on salary; Muse has none
 MAX_PER_COMPANY = 25
 ADZUNA_SKILLS_PER_POSTING = 2.0   # Stage 7, for comparison when the Adzuna files are missing
 
@@ -120,6 +123,42 @@ def page_path(paths: dict, category: str, page: int) -> Path:
     return paths["pages_dir"] / f"{category.lower().replace(' ', '_')}_{page:02d}.json"
 
 
+def get_page(category: str, page: int, log: list) -> tuple:
+    """Request one page, retrying network errors and HTTP RETRY_STATUSES with exponential backoff.
+
+    A 429 response's Retry-After header (seconds) is honoured when present. Every attempt is
+    appended to `log`. Returns (parsed JSON body or None, reason string when the page failed).
+    """
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        wait = BACKOFF_SECONDS * 2 ** (attempt - 1)
+        entry = {"time": datetime.now().isoformat(timespec="seconds"), "category": category,
+                 "page": page, "attempt": attempt}
+        try:
+            response = requests.get(API_URL, params={"category": category, "page": page},
+                                    headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
+                                    timeout=REQUEST_TIMEOUT)
+        except requests.RequestException as exc:
+            log.append({**entry, "status": f"error: {type(exc).__name__}"})
+            reason = f"page {page}: {type(exc).__name__} after {attempt} attempt(s)"
+        else:
+            log.append({**entry, "status": response.status_code})
+            if response.status_code == 200:
+                try:
+                    return response.json(), None
+                except ValueError:
+                    return None, f"page {page}: HTTP 200 but the body is not valid JSON"
+            reason = f"page {page} returned HTTP {response.status_code}"
+            if response.status_code not in RETRY_STATUSES:
+                return None, reason
+            retry_after = response.headers.get("Retry-After", "")
+            if response.status_code == 429 and retry_after.isdigit():
+                wait = max(wait, float(retry_after))
+        if attempt < MAX_ATTEMPTS:
+            logger.warning("%s; retrying in %.0f s", reason, wait)
+            time.sleep(wait)
+    return None, reason
+
+
 def fetch_category(paths: dict, category: str, log: list) -> dict:
     """Fetch PAGES of one requested category, caching each page and stopping past the last page.
 
@@ -134,15 +173,11 @@ def fetch_category(paths: dict, category: str, log: list) -> dict:
         else:
             if log:
                 time.sleep(SLEEP_SECONDS)
-            response = requests.get(API_URL, params={"category": muse_category, "page": page},
-                                    headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
-                                    timeout=REQUEST_TIMEOUT)
-            log.append({"time": datetime.now().isoformat(timespec="seconds"), "category": muse_category,
-                        "page": page, "status": response.status_code})
-            if response.status_code != 200:
-                stopped = f"page {page} returned HTTP {response.status_code}"
+            body, failure = get_page(muse_category, page, log)
+            if body is None:
+                stopped = failure
+                logger.warning("%s: stopped at %s", category, failure)
                 break
-            body = response.json()
             cache.write_text(json.dumps(body))
         pages += 1
         jobs += len(body.get("results", []))

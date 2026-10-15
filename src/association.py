@@ -36,18 +36,16 @@ MIN_SUPPORT = 0.05
 MIN_CONFIDENCE = 0.5
 MIN_LIFT = 1.5
 TOP_N_RULES = 20
-PLOT_MIN_LIFT = 1.2    # only edges at or above this lift are drawn in the network plot
-NODE_MAX_AREA = 2400   # marker area (pt^2) of the most frequent skill
+PLOT_MIN_LIFT = 1.2    # drawing all 191 edges makes the network unreadable
+NODE_MAX_AREA = 2400
 HIGH_TIER = "High"
-LOW_SUPPORT = 0.02     # second pass for technical-skill rules
+LOW_SUPPORT = 0.02
 TECHNICAL_SKILLS = frozenset(FORCED_SKILLS)
 TOP_TECH_PAIRS = 10
 
 RULE_COLUMNS = ["antecedents", "consequents", "antecedent support", "consequent support",
                 "support", "confidence", "lift", "leverage", "conviction"]
 
-# Chart styling: light chart surface, text inks, one categorical hue for nodes,
-# and a single-hue (blue) sequential ramp for lift on edges.
 SURFACE = "#fcfcfb"
 TEXT_PRIMARY = "#0b0b0b"
 TEXT_SECONDARY = "#52514e"
@@ -77,7 +75,12 @@ def generate_rules(itemsets: pd.DataFrame, min_confidence: float = MIN_CONFIDENC
     """Generate association rules with confidence > `min_confidence` and lift > `min_lift`, sorted by lift."""
     rules = association_rules(itemsets, metric="confidence", min_threshold=min_confidence)
     rules = rules[(rules["confidence"] > min_confidence) & (rules["lift"] > min_lift)]
-    rules = rules.sort_values(["lift", "support"], ascending=False)[RULE_COLUMNS].reset_index(drop=True)
+    # frozenset order follows Python's per-process hash seed, so ties need an explicit tie-breaker
+    # on the item names to give the same rule order (and the same top-N) on every run.
+    names = {col: rules[col].map(lambda items: ", ".join(sorted(items))) for col in ["antecedents", "consequents"]}
+    rules = (rules.assign(_a=names["antecedents"], _c=names["consequents"])
+             .sort_values(["lift", "support", "_a", "_c"], ascending=[False, False, True, True])
+             [RULE_COLUMNS].reset_index(drop=True))
     logger.info("Rules with confidence > %.2f and lift > %.2f: %d", min_confidence, min_lift, len(rules))
     return rules
 
@@ -112,6 +115,29 @@ def format_rules(rules: pd.DataFrame) -> pd.DataFrame:
     numeric = out.select_dtypes(include=np.number).columns.drop("jobs_with_itemset", errors="ignore")
     out[numeric] = out[numeric].round(4)
     return out
+
+
+def rule_key(antecedents: str, consequents: str) -> str:
+    """Return a canonical 'a, b -> c' key for a rule given format_rules-style item strings."""
+    return f"{antecedents} -> {consequents}"
+
+
+def rule_metrics(onehot: pd.DataFrame, antecedents: str, consequents: str) -> dict:
+    """Compute support, confidence, and lift of a rule directly on a one-hot transaction matrix.
+
+    Returns NaNs if a skill is absent from the matrix.
+    """
+    ante = [s.strip() for s in antecedents.split(",")]
+    cons = [s.strip() for s in consequents.split(",")]
+    if any(s not in onehot.columns for s in ante + cons):
+        return {"support": np.nan, "confidence": np.nan, "lift": np.nan}
+    a = onehot[ante].all(axis=1)
+    both = a & onehot[cons].all(axis=1)
+    support = both.mean()
+    confidence = both.sum() / a.sum() if a.any() else np.nan
+    cons_support = onehot[cons].all(axis=1).mean()
+    return {"support": support, "confidence": confidence,
+            "lift": confidence / cons_support if cons_support else np.nan}
 
 
 def build_cooccurrence_graph(itemsets: pd.DataFrame, n_transactions: int) -> nx.Graph:

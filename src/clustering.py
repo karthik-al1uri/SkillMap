@@ -58,28 +58,27 @@ SILHOUETTE_SAMPLE = 10_000
 SILHOUETTE_TARGET = 0.50
 DAVIES_BOULDIN_TARGET = 1.0
 DBSCAN_MIN_SAMPLES = 20
-DBSCAN_MAX_NOISE = 0.5        # candidate eps values labelling more than this share as noise are rejected
+DBSCAN_MAX_NOISE = 0.5        # a small eps can "win" on silhouette by calling most jobs noise
 TOP_SKILLS = 5
 TOP_TITLES = 5
-MIN_SKILL_PREVALENCE = 0.15   # a defining skill must appear in >= 15% of the cluster's jobs
+MIN_SKILL_PREVALENCE = 0.15   # stops rare skills with huge lift from naming a cluster
 GENERALIST_NAME = "Generalist (few listed skills)"
 NO_SKILLS_LABEL = -1
 NO_SKILLS_NAME = "No matched skills"
 TIER_LABELS = ["Low", "Mid", "High"]
-OUTLIER_CONTAMINATION = 0.01  # flag the top 1% most anomalous postings
+OUTLIER_CONTAMINATION = 0.01
 OUTLIER_N_ESTIMATORS = 300
-MISMATCH_Z = 2.0              # |z| of log salary within (cluster, experience) above this = salary mismatch
-OUTLIER_SVD_COMPONENTS = 10
-PLOT_SAMPLE = 8000            # jobs shown in the PCA and t-SNE plots
+MISMATCH_Z = 2.0
+OUTLIER_SVD_COMPONENTS = 10   # with 245 binary columns a random split rarely lands on salary
+PLOT_SAMPLE = 8000
 TSNE_PERPLEXITY = 30
 TSNE_MAX_ITER = 1000          # sklearn >= 1.7 calls n_iter max_iter
 PURITY_NEIGHBORS = 15
 HOTSPOT_NEIGHBORS = 30
 HOTSPOT_MIN_HIGH_SHARE = 0.7
 HOTSPOT_EPS = 3.0             # DBSCAN eps in t-SNE units
-HOTSPOT_MIN_SAMPLES = 20   # sensitivity run: skills compressed so salary carries more weight
+HOTSPOT_MIN_SAMPLES = 20
 
-# Skill -> theme used to name clusters from their defining skills.
 SKILL_THEMES = {
     "Healthcare & Clinical": [
         "patient care", "nursing", "registered nurse", "bls", "cpr", "acls", "healthcare",
@@ -107,13 +106,12 @@ SKILL_THEMES = {
     "Entry-Level & Credentials": ["high school diploma", "bachelor's degree", "master's degree"],
 }
 
-# Chart styling: light surface, text inks, categorical slots in fixed order, noise gray.
 SURFACE = "#fcfcfb"
 TEXT_PRIMARY = "#0b0b0b"
 TEXT_SECONDARY = "#52514e"
 GRID = "#e6e5e1"
 NOISE_COLOR = "#c9c8c2"
-TIER_COLORS = {"Low": "#86b6ef", "Mid": "#256abf", "High": "#0d366b"}   # ordinal blue ramp
+TIER_COLORS = {"Low": "#86b6ef", "Mid": "#256abf", "High": "#0d366b"}   # one hue, light to dark: tiers are ordered
 CATEGORICAL = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#4a3aa7", "#e34948"]
 
 

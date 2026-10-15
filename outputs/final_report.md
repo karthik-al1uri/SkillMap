@@ -1,6 +1,6 @@
 # SkillMap: Mining Skill Co-occurrence, Role Archetypes, and Salary Tiers from LinkedIn Job Postings
 
-**Author:** Karthik Alluri · CU Boulder, Data Mining, Fall 2026
+**Authors:** Karthik Alluri, Shashidhar Reddy Kanaparthi · CSCI 5502 Data Mining, University of Colorado Boulder, Fall 2026
 **Code:** https://github.com/karthik-al1uri/SkillMap
 
 ## Abstract
@@ -23,15 +23,15 @@ SkillMap is an end-to-end pipeline that goes from raw job postings to a data war
 
 ## 2. Dataset
 
-Three public Kaggle datasets are used for training and analysis. Two live APIs are used to validate the results on current postings:
+Three public Kaggle datasets [11]–[13] are used for training and analysis. Two live APIs are used to validate the results on current postings:
 
 | Dataset | Size | Key fields | Role in SkillMap |
 |---|---|---|---|
 | **LinkedIn Job Postings 2023-2024** (arshkon) | 123,849 postings, 11 linked tables | title, description, `normalized_salary`, `pay_period`, `formatted_experience_level`, location, company, industries, 35 job-function skill categories | Main analysis table |
 | **1.3M LinkedIn Jobs & Skills 2024** (asaniczka) | 1.29M postings with skill lists (396 MB postings, 642 MB skills, 4.8 GB summaries) | `job_link`, `job_skills` (comma-separated), title, level | Source of the skill vocabulary (no salaries) |
 | **Data Science Salaries 2020-2025** (arnabchaki) | 93,597 rows (83,997 U.S. full-time) | `salary_in_usd`, `experience_level`, `job_title`, `remote_ratio`, `company_size` | External salary benchmark |
-| **Adzuna API** (live, fetched 2026-10-14) | 1,150 US IT postings (25-call free tier) | title, company, location, `salary_min/max` (95% Adzuna-estimated), ~500-character description snippet | Live check (Stage 7); snippets too short for skill rules |
-| **The Muse API** (live, fetched 2026-10-14) | 1,378 unique postings in Software Engineering, Computer and IT, Data and Analytics, and Data Science (no API key) | title, company, locations, levels, categories, **full HTML description** (~810 words), publication date; no salary | **Validation source** for skill co-occurrence and demand (Stage 8) |
+| **Adzuna API** [14] (live, fetched 2026-10-14) | 1,150 US IT postings (25-call free tier) | title, company, location, `salary_min/max` (95% Adzuna-estimated), ~500-character description snippet | Live check (Stage 7); snippets too short for skill rules |
+| **The Muse API** [15] (live, fetched 2026-10-14) | 1,378 unique postings in Software Engineering, Computer and IT, Data and Analytics, and Data Science (no API key) | title, company, locations, levels, categories, **full HTML description** (~810 words), publication date; no salary | **Validation source** for skill co-occurrence and demand (Stage 8) |
 
 **Preprocessing decisions (Stage 2):**
 
@@ -333,25 +333,30 @@ Manufacturing (+14.8 pp) and healthcare (−9.2 pp) also shift, but they mirror 
 
 [1] R. Agrawal and R. Srikant, "Fast algorithms for mining association rules," in *Proc. 20th Int. Conf. Very Large Data Bases (VLDB)*, Santiago, Chile, 1994, pp. 487–499.
 
-[2] L. Breiman, "Random forests," *Machine Learning*, vol. 45, no. 1, pp. 5–32, 2001.
+[2] L. Breiman, "Random forests," *Mach. Learn.*, vol. 45, no. 1, pp. 5–32, 2001.
 
-[3] T. Chen and C. Guestrin, "XGBoost: A scalable tree boosting system," in *Proc. 22nd ACM SIGKDD Int. Conf. Knowledge Discovery and Data Mining*, San Francisco, CA, USA, 2016, pp. 785–794.
+[3] T. Chen and C. Guestrin, "XGBoost: A scalable tree boosting system," in *Proc. 22nd ACM SIGKDD Int. Conf. Knowl. Discovery Data Mining*, San Francisco, CA, USA, 2016, pp. 785–794.
 
-[4] J. MacQueen, "Some methods for classification and analysis of multivariate observations," in *Proc. 5th Berkeley Symp. Mathematical Statistics and Probability*, vol. 1, 1967, pp. 281–297.
+[4] J. MacQueen, "Some methods for classification and analysis of multivariate observations," in *Proc. 5th Berkeley Symp. Math. Statist. Probab.*, vol. 1, 1967, pp. 281–297.
 
-[5] M. Ester, H.-P. Kriegel, J. Sander, and X. Xu, "A density-based algorithm for discovering clusters in large spatial databases with noise," in *Proc. 2nd Int. Conf. Knowledge Discovery and Data Mining (KDD)*, Portland, OR, USA, 1996, pp. 226–231.
+[5] M. Ester, H.-P. Kriegel, J. Sander, and X. Xu, "A density-based algorithm for discovering clusters in large spatial databases with noise," in *Proc. 2nd Int. Conf. Knowl. Discovery Data Mining (KDD)*, Portland, OR, USA, 1996, pp. 226–231.
 
-[6] P. J. Rousseeuw, "Silhouettes: A graphical aid to the interpretation and validation of cluster analysis," *J. Computational and Applied Mathematics*, vol. 20, pp. 53–65, 1987.
+[6] P. J. Rousseeuw, "Silhouettes: A graphical aid to the interpretation and validation of cluster analysis," *J. Comput. Appl. Math.*, vol. 20, pp. 53–65, 1987.
 
-[7] D. L. Davies and D. W. Bouldin, "A cluster separation measure," *IEEE Trans. Pattern Analysis and Machine Intelligence*, vol. PAMI-1, no. 2, pp. 224–227, 1979.
+[7] D. L. Davies and D. W. Bouldin, "A cluster separation measure," *IEEE Trans. Pattern Anal. Mach. Intell.*, vol. PAMI-1, no. 2, pp. 224–227, 1979.
 
 [8] F. T. Liu, K. M. Ting, and Z.-H. Zhou, "Isolation forest," in *Proc. 8th IEEE Int. Conf. Data Mining (ICDM)*, Pisa, Italy, 2008, pp. 413–422.
 
-[9] L. van der Maaten and G. Hinton, "Visualizing data using t-SNE," *J. Machine Learning Research*, vol. 9, pp. 2579–2605, 2008.
+[9] L. van der Maaten and G. Hinton, "Visualizing data using t-SNE," *J. Mach. Learn. Res.*, vol. 9, pp. 2579–2605, 2008.
 
-[10] J. D. M. Rennie and N. Srebro, "Loss functions for preference levels: Regression with discrete ordered labels," in *Proc. IJCAI Multidisciplinary Workshop on Advances in Preference Handling*, Edinburgh, U.K., 2005, pp. 180–186.
+[10] J. D. M. Rennie and N. Srebro, "Loss functions for preference levels: Regression with discrete ordered labels," in *Proc. IJCAI Multidisciplinary Workshop Adv. Preference Handling*, Edinburgh, U.K., 2005, pp. 180–186.
 
-**Datasets:**
-- arshkon, "LinkedIn Job Postings (2023–2024)," Kaggle. https://www.kaggle.com/datasets/arshkon/linkedin-job-postings
-- asaniczka, "1.3M LinkedIn Jobs & Skills (2024)," Kaggle. https://www.kaggle.com/datasets/asaniczka/1-3m-linkedin-jobs-and-skills-2024
-- arnabchaki, "Data Science Salaries 2025," Kaggle. https://www.kaggle.com/datasets/arnabchaki/data-science-salaries-2025
+[11] arshkon, "LinkedIn job postings (2023–2024)," Kaggle. Accessed: Sep. 22, 2026. [Online]. Available: https://www.kaggle.com/datasets/arshkon/linkedin-job-postings
+
+[12] asaniczka, "1.3M LinkedIn jobs & skills (2024)," Kaggle. Accessed: Sep. 22, 2026. [Online]. Available: https://www.kaggle.com/datasets/asaniczka/1-3m-linkedin-jobs-and-skills-2024
+
+[13] arnabchaki, "Data science salaries 2025," Kaggle. Accessed: Sep. 22, 2026. [Online]. Available: https://www.kaggle.com/datasets/arnabchaki/data-science-salaries-2025
+
+[14] Adzuna, "Adzuna job search API (v1)." Accessed: Oct. 14, 2026. [Online]. Available: https://api.adzuna.com/v1/api/jobs/us/search
+
+[15] The Muse, "The Muse public jobs API." Accessed: Oct. 14, 2026. [Online]. Available: https://www.themuse.com/api/public/jobs

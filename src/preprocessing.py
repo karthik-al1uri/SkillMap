@@ -112,6 +112,26 @@ SKILL_PATTERNS = {
     "airflow": r"(?<![a-z0-9])apache\s*airflow(?![a-z0-9])|" + _near("airflow", _DATA_STACK),
     "dbt": r"(?<![a-z0-9])(?:data\s*build\s*tool|dbt\s*(?:cloud|core|labs))(?![a-z0-9])|" + _near("dbt", _DATA_STACK),
     "transformers": r"(?<![a-z0-9])hugging\s*face\s*transformers(?![a-z0-9])|" + _near("transformers?", _ML_STACK),
+    # Phase 6: "driving" only as a driving requirement, not "driving sales/results/innovation".
+    "driving": r"(?<![a-z0-9])(?:safe|defensive|commercial|truck|forklift|clean|good|acceptable)\s+driving(?![a-z0-9])"
+               r"|(?<![a-z0-9])driving\s+(?:record|history|abstract|experience|test|privileges|licen[cs]e)(?![a-z0-9])"
+               + "|" + _near("driving", r"(?:driver'?s?|licen[cs]e|vehicles?|cars?|trucks?|vans?|cdl|mvr|miles)", 40),
+    # Phase 6: the soft skill, not "our organization" / "the organization".
+    "organization": r"(?<![a-z0-9])organi[sz]ation(?:al)?(?:\s+(?:and|&)\s+[a-z\-]+)?\s+(?:skills|abilit(?:y|ies))"
+                    r"|(?<![a-z0-9])(?:strong|excellent|good|great|exceptional|outstanding|superb|superior|solid|"
+                    r"effective|keen)\s+organi[sz]ation(?:al)?(?![a-z0-9])"
+                    + "|" + _listed_with("organi[sz]ation",
+                                         r"(?:communication|interpersonal|analytical|prioritization|multi-?\s*tasking|planning)"),
+}
+
+# Phase 6: phrases where a skill word has another meaning; they are blanked before matching that skill.
+SKILL_EXCLUSIONS = {
+    "supervision": r"(?<![a-z0-9])under\s+(?:the\s+)?(?:[a-z]+\s+)?supervision"
+                   r"|(?<![a-z0-9])(?:minimal|minimum|limited|little|no|close|moderate|general|immediate|without)\s+supervision",
+    "security": r"(?<![a-z0-9])social\s+security",
+    "reporting": r"(?<![a-z0-9])reporting\s+(?:directly\s+)?to(?![a-z0-9])",
+    "excel": r"(?<![a-z0-9])(?:to|you|will|can|could|who|they|we)\s+excel(?![a-z0-9])"
+             r"|(?<![a-z0-9])excel\s+(?:at|in|as)(?![a-z0-9])",
 }
 
 # Frequent linkedin_jobs "skills" that are benefits or legal boilerplate, not skills.
@@ -460,13 +480,19 @@ def match_description_skills(df: pd.DataFrame, vocab: pd.DataFrame) -> pd.Series
                   if any(other != skill and re.search(patterns[other], form)
                          for other in patterns for form in forms[skill])]
 
+    def contains(skill: str, text: pd.Series) -> pd.Series:
+        """Return whether `skill` occurs in each text once its SKILL_EXCLUSIONS phrases are blanked."""
+        if skill in SKILL_EXCLUSIONS:
+            text = text.str.replace(SKILL_EXCLUSIONS[skill], " ", regex=True)
+        return text.str.contains(patterns[skill], regex=True)
+
     hits = {}
     for skill in sorted(containers, key=lambda s: max(len(f) for f in forms[s]), reverse=True):
-        hits[skill] = text.str.contains(patterns[skill], regex=True)
+        hits[skill] = contains(skill, text)
         text = text.str.replace(patterns[skill], " ", regex=True)
     for skill in patterns:
         if skill not in hits:
-            hits[skill] = text.str.contains(patterns[skill], regex=True)
+            hits[skill] = contains(skill, text)
     hits = pd.DataFrame(hits, index=df.index)[list(patterns)]
     matched = hits.apply(lambda row: row.index[row.to_numpy()].tolist(), axis=1)
     logger.info("Matched skills: %d nested phrases matched first (%s)", len(containers), ", ".join(containers))
@@ -611,6 +637,8 @@ def build_summary(cleaned: pd.DataFrame, jobs_skills: pd.DataFrame, vocab: pd.Da
         f"Vocabulary skills never matched: {unmatched if unmatched else 'none'}",
         f"Excluded non-skill terms: {sorted(EXCLUDED_TERMS)}",
         f"Synonyms merged: {SKILL_SYNONYMS}",
+        f"Context-restricted skills (Phase 6): driving, organization; phrases excluded per skill: "
+        f"{ {k: v.count('|') + 1 for k, v in SKILL_EXCLUSIONS.items()} } (see SKILL_EXCLUSIONS)",
         "Spelling variants per skill are listed in data/processed/skill_vocabulary.csv",
         "Most frequent matched skills:",
         matched_counts.head(20).to_string(),

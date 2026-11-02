@@ -120,7 +120,7 @@ CREATE TABLE IF NOT EXISTS muse_job_postings (
 SNAPSHOT_SQL = """
 SELECT * FROM (
     SELECT *, ROW_NUMBER() OVER (PARTITION BY fetch_date, company_name
-                                 ORDER BY publication_date DESC, id) AS company_rank
+                                 ORDER BY {order}) AS company_rank
     FROM muse_job_postings
     WHERE fetch_date = ?
 )
@@ -489,7 +489,9 @@ def load_snapshot(db_path: Path, fetch_date: str = None, max_per_company: int = 
     fetch_date = fetch_date or warehouse_snapshots(db_path)[-1]
     cap = max_per_company or None
     with sqlite3.connect(db_path) as conn:
-        df = pd.read_sql_query(SNAPSHOT_SQL, conn, params=(fetch_date, cap, cap))
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(muse_job_postings)")}
+        order = "publication_date DESC, id" if "publication_date" in columns else "id"   # pre-migration table
+        df = pd.read_sql_query(SNAPSHOT_SQL.format(order=order), conn, params=(fetch_date, cap, cap))
     df["matched_skills"] = df["matched_skills"].map(json.loads)
     return df.drop(columns="company_rank")
 
@@ -766,13 +768,13 @@ def run_pipeline(project_root: Path = None, new_snapshot: bool = False, fetch_da
     capped = {"n": capped_n, "support": capped_support, "n_rules": len(capped_rules), "cap": max_per_company}
     validation = validate_rules(pd.read_csv(output_dir / "04_association_rules.csv"), rules, onehot,
                                 capped_rules, capped_onehot)
-    validation.to_csv(output_dir / "08_rules_validation.csv", index=False)
+    validation.assign(fetch_date=fetch_date).to_csv(output_dir / "08_rules_validation.csv", index=False)
 
     train = load_cleaned_jobs(root / "data" / "processed" / "cleaned_jobs.csv")
     labels = pd.read_csv(output_dir / "06_cluster_labels.csv")
     tech_ids = set(labels.loc[labels["kmeans_cluster_name"] == "Data, Tech & Engineering", "job_id"])
     comparison = skill_comparison(muse, train, tech_ids, capped_muse)
-    comparison.to_csv(output_dir / "08_skill_comparison.csv", index=False)
+    comparison.assign(fetch_date=fetch_date).to_csv(output_dir / "08_skill_comparison.csv", index=False)
 
     summary = build_summary(fetch_date, stats, total, n_unique, n_reposts, raw, muse, train, adzuna_reference(root),
                             warehouse, rules, support, n_qualify, validation, comparison, len(log), capped)

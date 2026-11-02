@@ -21,14 +21,24 @@ after the id dedup. A few employers dominate the results (SpaceX alone is about 
 shared employer boilerplate creates spurious rules, so validation is repeated with at most
 MAX_PER_COMPANY postings per company as a sensitivity check.
 
-Every page is cached under data/raw/muse_live/pages/, so reruns and the notebook do not
-call the API again.
+Snapshots: each fetch is a snapshot keyed by fetch_date. Pages are cached under
+data/raw/muse_live/pages/<fetch_date>/ (the original 2026-10-14 fetch sits directly in pages/),
+and the cleaned CSV and warehouse table hold one set of rows per fetch_date. Reprocessing a
+snapshot replaces only its own rows, so running twice is safe. The default run uses cached
+pages only and makes no API calls.
+
+Company cap: analysis queries keep at most `max_per_company` postings per company and snapshot
+(most recent first); no rows are deleted.
 
 Run from the project root with:
-    python -m src.muse_pipeline
+    python -m src.muse_pipeline                       # latest cached snapshot, no API calls
+    python -m src.muse_pipeline --new-snapshot        # fetch today's snapshot (live API calls)
+    python -m src.muse_pipeline --fetch-date 2026-10-14 --max-per-company 50
 """
+import argparse
 import json
 import logging
+import re
 import sqlite3
 import time
 from ast import literal_eval
@@ -86,11 +96,13 @@ ADZUNA_SKILLS_PER_POSTING = 2.0   # Stage 7, for comparison when the Adzuna file
 
 CLEANED_COLUMNS = ["id", "job_title", "company_name", "location", "state", "experience_level",
                    "categories", "matched_skills", "n_skills", "fetch_date", "publication_date"]
+TABLE_COLUMNS = ["id", "job_title", "company_name", "location", "state", "experience_level",
+                 "matched_skills", "n_skills", "source", "fetch_date", "publication_date"]
+DATE_DIR = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 MUSE_TABLE_SQL = """
-DROP TABLE IF EXISTS muse_job_postings;
-CREATE TABLE muse_job_postings (
-    id                TEXT PRIMARY KEY,
+CREATE TABLE IF NOT EXISTS muse_job_postings (
+    id                TEXT NOT NULL,
     job_title         TEXT,
     company_name      TEXT,
     location          TEXT,
@@ -99,8 +111,21 @@ CREATE TABLE muse_job_postings (
     matched_skills    TEXT,
     n_skills          INTEGER,
     source            TEXT DEFAULT 'muse_live',
-    fetch_date        TEXT
+    fetch_date        TEXT NOT NULL,
+    publication_date  TEXT,
+    PRIMARY KEY (id, fetch_date)
 );
+"""
+
+SNAPSHOT_SQL = """
+SELECT * FROM (
+    SELECT *, ROW_NUMBER() OVER (PARTITION BY fetch_date, company_name
+                                 ORDER BY publication_date DESC, id) AS company_rank
+    FROM muse_job_postings
+    WHERE fetch_date = ?
+)
+WHERE ? IS NULL OR company_rank <= ?
+ORDER BY id
 """
 
 
@@ -118,9 +143,61 @@ def muse_paths(root: Path) -> dict:
     }
 
 
-def page_path(paths: dict, category: str, page: int) -> Path:
-    """Return the cache file for one category page."""
-    return paths["pages_dir"] / f"{category.lower().replace(' ', '_')}_{page:02d}.json"
+def legacy_fetch_date(paths: dict):
+    """Date of the original snapshot cached directly in pages/, or None if there is none.
+
+    Taken from the last fetch-log entry without a fetch_date (entries from later snapshots carry one).
+    """
+    flat = sorted(paths["pages_dir"].glob("*.json")) if paths["pages_dir"].is_dir() else []
+    if not flat:
+        return None
+    log = json.loads(paths["fetch_log"].read_text()) if paths["fetch_log"].exists() else []
+    legacy = [e["time"][:10] for e in log if "fetch_date" not in e]
+    if legacy:
+        return legacy[-1]
+    return datetime.fromtimestamp(max(p.stat().st_mtime for p in flat)).strftime("%Y-%m-%d")
+
+
+def list_snapshots(paths: dict) -> list:
+    """Sorted fetch_dates that have cached pages."""
+    dates = {d.name for d in paths["pages_dir"].glob("*")
+             if d.is_dir() and DATE_DIR.match(d.name) and any(d.glob("*.json"))}
+    legacy = legacy_fetch_date(paths)
+    if legacy:
+        dates.add(legacy)
+    return sorted(dates)
+
+
+def snapshot_dir(paths: dict, fetch_date: str) -> Path:
+    """Page cache directory of one snapshot (the legacy snapshot lives directly in pages/)."""
+    dated = paths["pages_dir"] / fetch_date
+    if not dated.is_dir() and fetch_date == legacy_fetch_date(paths):
+        return paths["pages_dir"]
+    return dated
+
+
+def resolve_fetch_date(paths: dict, fetch_date: str = None, new_snapshot: bool = False) -> str:
+    """Return the snapshot to process: today for a new snapshot, else `fetch_date` or the latest cached one."""
+    if new_snapshot:
+        return datetime.now().strftime("%Y-%m-%d")
+    snapshots = list_snapshots(paths)
+    if fetch_date is None:
+        if not snapshots:
+            raise FileNotFoundError(f"No cached Muse snapshot in {paths['pages_dir']}; run with --new-snapshot")
+        return snapshots[-1]
+    if fetch_date not in snapshots:
+        raise FileNotFoundError(f"No cached snapshot for {fetch_date}; available: {', '.join(snapshots) or 'none'}")
+    return fetch_date
+
+
+def page_file(directory: Path, category: str, page: int) -> Path:
+    """Return the cache file for one category page inside a snapshot directory."""
+    return directory / f"{category.lower().replace(' ', '_')}_{page:02d}.json"
+
+
+def page_path(paths: dict, category: str, page: int, fetch_date: str = None) -> Path:
+    """Return the cache file for one category page of a snapshot (default: the latest cached one)."""
+    return page_file(snapshot_dir(paths, fetch_date or resolve_fetch_date(paths)), category, page)
 
 
 def get_page(category: str, page: int, log: list) -> tuple:
@@ -159,17 +236,23 @@ def get_page(category: str, page: int, log: list) -> tuple:
     return None, reason
 
 
-def fetch_category(paths: dict, category: str, log: list) -> dict:
+def fetch_category(paths: dict, category: str, log: list, fetch_date: str = None,
+                   allow_fetch: bool = True) -> dict:
     """Fetch PAGES of one requested category, caching each page and stopping past the last page.
 
-    Returns {"category", "muse_category", "pages", "jobs", "total", "stopped"}.
+    With allow_fetch=False only cached pages are read. Returns {"category", "muse_category",
+    "pages", "jobs", "total", "stopped"}.
     """
     muse_category = MUSE_CATEGORIES[category]
+    directory = snapshot_dir(paths, fetch_date or resolve_fetch_date(paths))
     jobs, pages, total, stopped = 0, 0, None, "all pages fetched"
     for page in PAGES:
-        cache = page_path(paths, category, page)
+        cache = page_file(directory, category, page)
         if cache.exists():
             body = json.loads(cache.read_text())
+        elif not allow_fetch:
+            stopped = f"page {page} not cached"
+            break
         else:
             if log:
                 time.sleep(SLEEP_SECONDS)
@@ -190,28 +273,36 @@ def fetch_category(paths: dict, category: str, log: list) -> dict:
             "total": total, "stopped": stopped}
 
 
-def fetch_all(paths: dict) -> pd.DataFrame:
-    """Fetch every requested category (cached pages are reused) and return one row per category."""
-    paths["pages_dir"].mkdir(parents=True, exist_ok=True)
+def fetch_all(paths: dict, fetch_date: str = None, allow_fetch: bool = False) -> pd.DataFrame:
+    """Read one snapshot's pages for every requested category and return one row per category.
+
+    fetch_date defaults to the latest cached snapshot. Only with allow_fetch=True are missing
+    pages requested from the API (cached pages are always reused, so a rerun makes no calls).
+    """
+    fetch_date = fetch_date or resolve_fetch_date(paths)
+    pages_dir = snapshot_dir(paths, fetch_date)
+    pages_dir.mkdir(parents=True, exist_ok=True)
     log = json.loads(paths["fetch_log"].read_text()) if paths["fetch_log"].exists() else []
     new_log = []
-    stats = [fetch_category(paths, category, new_log) for category in MUSE_CATEGORIES]
+    stats = [fetch_category(paths, category, new_log, fetch_date, allow_fetch) for category in MUSE_CATEGORIES]
+    new_log = [{**entry, "fetch_date": fetch_date} for entry in new_log]
     if new_log:
         paths["fetch_log"].write_text(json.dumps(log + new_log, indent=1))
     logger.info("Fetch: %d new API calls (%d logged in total)", len(new_log), len(log) + len(new_log))
     return pd.DataFrame(stats)
 
 
-def combine_pages(paths: dict) -> tuple:
-    """Merge cached pages into unique postings (by id) and save raw_jobs.json.
+def combine_pages(paths: dict, fetch_date: str = None) -> tuple:
+    """Merge one snapshot's cached pages (default: latest) into unique postings (by id) and save raw_jobs.json.
 
     Returns (unique postings, total fetched including duplicates). Each posting gets a
     `fetched_categories` list of the requested categories it was found under.
     """
+    directory = snapshot_dir(paths, fetch_date or resolve_fetch_date(paths))
     by_id, total = {}, 0
     for category in MUSE_CATEGORIES:
         for page in PAGES:
-            cache = page_path(paths, category, page)
+            cache = page_file(directory, category, page)
             if not cache.exists():
                 break
             for job in json.loads(cache.read_text()).get("results", []):
@@ -258,9 +349,12 @@ def drop_reposts(raw: pd.DataFrame) -> tuple:
 
 
 def cap_per_company(muse: pd.DataFrame, cap: int = MAX_PER_COMPANY) -> pd.DataFrame:
-    """Return at most `cap` randomly chosen postings per company (random_state=42)."""
-    shuffled = muse.sample(frac=1, random_state=42)
-    return shuffled.groupby("company_name", dropna=False).head(cap).reset_index(drop=True)
+    """In-memory version of the SNAPSHOT_SQL cap: the `cap` most recent postings per company and fetch_date."""
+    if not cap:
+        return muse.reset_index(drop=True)
+    ordered = muse.sort_values(["publication_date", "id"], ascending=[False, True], na_position="last")
+    keep = ordered.groupby(["fetch_date", "company_name"], dropna=False).head(cap).index
+    return muse.loc[muse.index.isin(keep)].sort_values("id").reset_index(drop=True)
 
 
 def save_raw_csv(raw: pd.DataFrame, path: Path) -> None:
@@ -317,28 +411,87 @@ def preprocess(raw: pd.DataFrame, vocab: pd.DataFrame, fetch_date: str) -> pd.Da
     return out[CLEANED_COLUMNS]
 
 
-def load_muse_cleaned(path: Path) -> pd.DataFrame:
-    """Read muse_cleaned_jobs.csv back with matched_skills parsed into lists."""
-    df = pd.read_csv(path, dtype={"id": str})
+def load_muse_cleaned(path: Path, fetch_date: str = None) -> pd.DataFrame:
+    """Read muse_cleaned_jobs.csv back with matched_skills parsed into lists (optionally one snapshot)."""
+    df = pd.read_csv(path, dtype={"id": str, "fetch_date": str})
+    if fetch_date is not None:
+        df = df[df["fetch_date"] == fetch_date].reset_index(drop=True)
     df["matched_skills"] = df["matched_skills"].apply(literal_eval)
     return df
 
 
-def load_into_warehouse(muse: pd.DataFrame, db_path: Path) -> dict:
-    """(Re)create muse_job_postings (one row per posting) and return the verification query result.
+def save_cleaned(muse: pd.DataFrame, path: Path) -> pd.DataFrame:
+    """Upsert snapshots into muse_cleaned_jobs.csv: replace rows of the fetch_dates in `muse`, keep the others.
 
-    matched_skills is stored as a JSON array string.
+    Returns all snapshots, with matched_skills as lists.
     """
-    table = muse[["id", "job_title", "company_name", "location", "state", "experience_level",
-                  "matched_skills", "n_skills", "fetch_date"]].copy()
-    table["matched_skills"] = table["matched_skills"].map(json.dumps)
-    table["source"] = SOURCE
-    with sqlite3.connect(db_path) as conn:
+    out = muse
+    if path.exists():
+        old = load_muse_cleaned(path)
+        out = pd.concat([old[~old["fetch_date"].isin(muse["fetch_date"])], muse], ignore_index=True)
+    out = out.sort_values(["fetch_date", "id"]).reset_index(drop=True)
+    out[CLEANED_COLUMNS].to_csv(path, index=False)
+    logger.info("%s: %d rows over snapshots %s", path.name, len(out), out["fetch_date"].value_counts().sort_index().to_dict())
+    return out
+
+
+def ensure_muse_table(conn: sqlite3.Connection) -> None:
+    """Create muse_job_postings, migrating the earlier one-snapshot table (id-only key) in place."""
+    info = conn.execute("PRAGMA table_info(muse_job_postings)").fetchall()
+    pk = [row[1] for row in sorted(info, key=lambda r: r[5]) if row[5]]
+    if info and pk != ["id", "fetch_date"]:
+        old_cols = [row[1] for row in info if row[1] in TABLE_COLUMNS]
+        conn.execute("ALTER TABLE muse_job_postings RENAME TO muse_job_postings_old")
         conn.executescript(MUSE_TABLE_SQL)
+        conn.execute(f"INSERT INTO muse_job_postings ({', '.join(old_cols)}) "
+                     f"SELECT {', '.join(old_cols)} FROM muse_job_postings_old")
+        conn.execute("DROP TABLE muse_job_postings_old")
+        logger.info("Migrated muse_job_postings to a (id, fetch_date) key")
+    conn.executescript(MUSE_TABLE_SQL)
+
+
+def load_into_warehouse(muse: pd.DataFrame, db_path: Path) -> dict:
+    """Upsert the snapshots in `muse` into muse_job_postings (one row per posting and fetch_date).
+
+    Rows of other fetch_dates are kept, so loading the same snapshot twice is safe. matched_skills
+    is stored as a JSON array string. Returns the row count and mean skills of the loaded
+    snapshots plus {fetch_date: rows} for the whole table.
+    """
+    table = muse.assign(matched_skills=muse["matched_skills"].map(json.dumps), source=SOURCE)
+    table = table.reindex(columns=TABLE_COLUMNS)
+    dates = sorted(table["fetch_date"].unique())
+    marks = ", ".join("?" * len(dates))
+    with sqlite3.connect(db_path) as conn:
+        ensure_muse_table(conn)
+        conn.execute(f"DELETE FROM muse_job_postings WHERE fetch_date IN ({marks})", dates)
         table.to_sql("muse_job_postings", conn, if_exists="append", index=False)
-        count, avg_skills = conn.execute("SELECT COUNT(*), AVG(n_skills) FROM muse_job_postings").fetchone()
-    logger.info("muse_job_postings: %d rows, mean %.2f skills", count, avg_skills)
-    return {"rows": count, "avg_skills": avg_skills}
+        count, avg_skills = conn.execute(f"SELECT COUNT(*), AVG(n_skills) FROM muse_job_postings "
+                                         f"WHERE fetch_date IN ({marks})", dates).fetchone()
+        snapshots = dict(conn.execute("SELECT fetch_date, COUNT(*) FROM muse_job_postings "
+                                      "GROUP BY fetch_date ORDER BY fetch_date").fetchall())
+    logger.info("muse_job_postings: %d rows for %s, mean %.2f skills; snapshots %s",
+                count, ", ".join(dates), avg_skills, snapshots)
+    return {"rows": count, "avg_skills": avg_skills, "snapshots": snapshots}
+
+
+def warehouse_snapshots(db_path: Path) -> list:
+    """Sorted fetch_dates in muse_job_postings (empty if the table does not exist)."""
+    with sqlite3.connect(db_path) as conn:
+        if not conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'muse_job_postings'").fetchone():
+            return []
+        return [r[0] for r in conn.execute("SELECT DISTINCT fetch_date FROM muse_job_postings ORDER BY 1")]
+
+
+def load_snapshot(db_path: Path, fetch_date: str = None, max_per_company: int = None) -> pd.DataFrame:
+    """Query one snapshot (default: latest) from muse_job_postings, keeping at most `max_per_company`
+    postings per company (most recent first; None or 0 = no cap). matched_skills is parsed into lists.
+    """
+    fetch_date = fetch_date or warehouse_snapshots(db_path)[-1]
+    cap = max_per_company or None
+    with sqlite3.connect(db_path) as conn:
+        df = pd.read_sql_query(SNAPSHOT_SQL, conn, params=(fetch_date, cap, cap))
+    df["matched_skills"] = df["matched_skills"].map(json.loads)
+    return df.drop(columns="company_rank")
 
 
 def mine_muse_rules(muse: pd.DataFrame) -> tuple:
@@ -406,12 +559,14 @@ def validate_rules(train_rules: pd.DataFrame, muse_rules: pd.DataFrame, onehot: 
     return out.sort_values(["validated", "lift_holds", "muse_lift"], ascending=False).reset_index(drop=True)
 
 
-def skill_comparison(muse: pd.DataFrame, train: pd.DataFrame, tech_ids: set) -> pd.DataFrame:
+def skill_comparison(muse: pd.DataFrame, train: pd.DataFrame, tech_ids: set,
+                     capped: pd.DataFrame = None) -> pd.DataFrame:
     """Share of postings listing each skill: Muse vs all training jobs vs training tech jobs.
 
     Training tech jobs = the Stage 6 "Data, Tech & Engineering" cluster, the closest training
     counterpart to the Muse tech categories. change_vs_tech_pp is the Muse share minus the
-    training tech share, in percentage points.
+    training tech share, in percentage points. With `capped` (the company-capped sample),
+    muse_share_capped is added.
     """
     def shares(lists: pd.Series) -> pd.Series:
         """Share of postings listing each skill."""
@@ -421,6 +576,8 @@ def skill_comparison(muse: pd.DataFrame, train: pd.DataFrame, tech_ids: set) -> 
     out = pd.DataFrame({"muse_share": shares(muse["matched_skills"]),
                         "train_share": shares(train["matched_skills"]),
                         "train_tech_share": shares(tech["matched_skills"])}).fillna(0)
+    if capped is not None:
+        out["muse_share_capped"] = shares(capped["matched_skills"]).reindex(out.index).fillna(0)
     out["is_technical"] = out.index.isin(TECHNICAL_SKILLS)
     out["change_vs_tech_pp"] = 100 * (out["muse_share"] - out["train_tech_share"])
     out["ratio_vs_tech"] = out["muse_share"] / out["train_tech_share"].replace(0, np.nan)
@@ -448,7 +605,8 @@ def adzuna_reference(root: Path) -> dict:
     return out
 
 
-def key_finding(validation: pd.DataFrame, shifts: tuple, muse: pd.DataFrame, top_share: tuple) -> str:
+def key_finding(validation: pd.DataFrame, shifts: tuple, muse: pd.DataFrame, top_share: tuple,
+                cap: int = MAX_PER_COMPANY) -> str:
     """Compose the 2-3 sentence key finding from the computed results."""
     n, validated = len(validation), int(validation["validated"].sum())
     capped = int(validation["validated_company_capped"].sum())
@@ -462,7 +620,7 @@ def key_finding(validation: pd.DataFrame, shifts: tuple, muse: pd.DataFrame, top
     rises, drops = shifts
     return " ".join([
         f"Only {validated} of {n} top training rules are confirmed on current Muse tech postings, {recent:.0%} of "
-        f"them published in the 90 days before the fetch ({capped} of {n} with at most {MAX_PER_COMPANY} postings "
+        f"them published in the 90 days before the fetch ({capped} of {n} with at most {cap} postings "
         f"per company): "
         f"{', '.join(confirmed) if len(confirmed) else 'none'}.",
         f"Most of the rest did not break: {len(ceiling)} of the {len(failed)} failing rules point to skills "
@@ -487,6 +645,8 @@ def build_summary(fetch_date: str, stats: pd.DataFrame, total: int, n_unique: in
     tech = comparison[comparison["is_technical"]].head(10)
     cols = ["skill", "muse_share", "train_tech_share", "train_share", "change_vs_tech_pp"]
     validated = validation[validation["validated"]].sort_values("muse_lift", ascending=False)
+    cap = capped.get("cap", MAX_PER_COMPANY)
+    snapshots = warehouse.get("snapshots", {fetch_date: warehouse["rows"]})
     parts = [
         "SkillMap — Stage 8 The Muse Live Skill Validation Summary",
         f"Generated: {datetime.now():%Y-%m-%d %H:%M:%S}",
@@ -516,7 +676,9 @@ def build_summary(fetch_date: str, stats: pd.DataFrame, total: int, n_unique: in
         f"({n_qualify / len(muse):.1%})",
         "",
         f"{line}\nWarehouse (data/processed/skillmap.db, table muse_job_postings)\n{line}",
-        f"SELECT COUNT(*), AVG(n_skills) FROM muse_job_postings -> {warehouse['rows']:,}, {warehouse['avg_skills']:.2f}",
+        f"SELECT COUNT(*), AVG(n_skills) FROM muse_job_postings WHERE fetch_date = '{fetch_date}' -> "
+        f"{warehouse['rows']:,}, {warehouse['avg_skills']:.2f}",
+        "Snapshots (fetch_date: rows): " + ", ".join(f"{d}: {k:,}" for d, k in snapshots.items()),
         "",
         f"{line}\nAssociation rule validation (outputs/08_rules_validation.csv)\n{line}",
         f"Transactions: {n_qualify:,} postings with >= {MIN_SKILLS} skills. min_support={support}, "
@@ -526,7 +688,7 @@ def build_summary(fetch_date: str, stats: pd.DataFrame, total: int, n_unique: in
         f"({validation['validated'].mean():.0%})",
         f"Training rules whose confidence > {assoc.MIN_CONFIDENCE} and lift > {assoc.MIN_LIFT} still hold on Muse "
         f"data, ignoring support: {int(validation['lift_holds'].sum())} of {len(validation)}",
-        f"Company-capped sensitivity (at most {MAX_PER_COMPANY} postings per company: {capped['n']:,} postings, "
+        f"Company-capped sensitivity (at most {cap} most recent postings per company: {capped['n']:,} postings, "
         f"min_support={capped['support']}, {capped['n_rules']:,} rules): "
         f"{int(validation['validated_company_capped'].sum())} of {len(validation)} training rules confirmed",
         "muse_max_lift = 1 / support of the rule's consequent in Muse data (the highest lift possible).",
@@ -558,40 +720,50 @@ def build_summary(fetch_date: str, stats: pd.DataFrame, total: int, n_unique: in
         "",
         f"{line}\nKey finding\n{line}",
         key_finding(validation, (rises, drops), muse,
-                    (muse["company_name"].value_counts().index[0], muse["company_name"].value_counts(normalize=True).iloc[0])),
+                    (muse["company_name"].value_counts().index[0], muse["company_name"].value_counts(normalize=True).iloc[0]),
+                    cap),
         "",
     ]
     return "\n".join(parts)
 
 
-def run_pipeline(project_root: Path = None) -> dict:
-    """Run Stage 8 end to end, reusing cached pages whenever they exist."""
+def run_pipeline(project_root: Path = None, new_snapshot: bool = False, fetch_date: str = None,
+                 max_per_company: int = MAX_PER_COMPANY) -> dict:
+    """Run Stage 8 end to end on one snapshot.
+
+    By default the latest cached snapshot is processed with no API calls; `fetch_date` picks another
+    cached one. new_snapshot=True fetches today's snapshot (only missing pages are requested). The
+    snapshot is upserted into the cleaned CSV and the warehouse; analysis runs on it, with the
+    company-capped repeat keeping at most `max_per_company` postings per company (0 = no cap).
+    """
     root = project_root or find_project_root()
     paths = muse_paths(root)
     output_dir = root / "outputs"
     paths["raw_dir"].mkdir(parents=True, exist_ok=True)
+    fetch_date = resolve_fetch_date(paths, fetch_date, new_snapshot)
+    logger.info("Snapshot %s (%s)", fetch_date, "new fetch" if new_snapshot else "cache only")
 
-    stats = fetch_all(paths)
-    postings, total = combine_pages(paths)
+    stats = fetch_all(paths, fetch_date, allow_fetch=new_snapshot)
+    postings, total = combine_pages(paths, fetch_date)
     raw = extract_postings(postings)
     save_raw_csv(raw, paths["raw_csv"])
     n_unique = len(raw)
     raw, n_reposts = drop_reposts(raw)
     log = json.loads(paths["fetch_log"].read_text()) if paths["fetch_log"].exists() else []
-    fetch_date = log[-1]["time"][:10] if log else datetime.now().strftime("%Y-%m-%d")
 
     vocab = pd.read_csv(root / "data" / "processed" / "skill_vocabulary.csv")
     vocab["forms"] = vocab["forms"].apply(literal_eval)
-    muse = preprocess(raw, vocab, fetch_date)
-    muse.to_csv(paths["cleaned"], index=False)
-    muse = load_muse_cleaned(paths["cleaned"])
+    all_snapshots = save_cleaned(preprocess(raw, vocab, fetch_date), paths["cleaned"])
 
-    warehouse = load_into_warehouse(muse, paths["db"])
+    warehouse = load_into_warehouse(all_snapshots, paths["db"])
+    muse = load_snapshot(paths["db"], fetch_date)
+    capped_muse = load_snapshot(paths["db"], fetch_date, max_per_company)
+    warehouse.update(rows=len(muse), avg_skills=muse["n_skills"].mean())
 
     onehot, rules, support, n_qualify = mine_muse_rules(muse)
     rules.to_csv(output_dir / "08_muse_association_rules.csv", index=False)
-    capped_onehot, capped_rules, capped_support, capped_n = mine_muse_rules(cap_per_company(muse))
-    capped = {"n": capped_n, "support": capped_support, "n_rules": len(capped_rules)}
+    capped_onehot, capped_rules, capped_support, capped_n = mine_muse_rules(capped_muse)
+    capped = {"n": capped_n, "support": capped_support, "n_rules": len(capped_rules), "cap": max_per_company}
     validation = validate_rules(pd.read_csv(output_dir / "04_association_rules.csv"), rules, onehot,
                                 capped_rules, capped_onehot)
     validation.to_csv(output_dir / "08_rules_validation.csv", index=False)
@@ -599,19 +771,38 @@ def run_pipeline(project_root: Path = None) -> dict:
     train = load_cleaned_jobs(root / "data" / "processed" / "cleaned_jobs.csv")
     labels = pd.read_csv(output_dir / "06_cluster_labels.csv")
     tech_ids = set(labels.loc[labels["kmeans_cluster_name"] == "Data, Tech & Engineering", "job_id"])
-    comparison = skill_comparison(muse, train, tech_ids)
+    comparison = skill_comparison(muse, train, tech_ids, capped_muse)
     comparison.to_csv(output_dir / "08_skill_comparison.csv", index=False)
 
     summary = build_summary(fetch_date, stats, total, n_unique, n_reposts, raw, muse, train, adzuna_reference(root),
                             warehouse, rules, support, n_qualify, validation, comparison, len(log), capped)
     (output_dir / "08_muse_summary.txt").write_text(summary, encoding="utf-8")
     logger.info("Saved %s", output_dir / "08_muse_summary.txt")
-    return {"stats": stats, "total": total, "n_unique": n_unique, "n_reposts": n_reposts, "capped": capped,
-            "capped_rules": capped_rules, "raw": raw, "muse": muse, "warehouse": warehouse, "rules": rules,
-            "support": support, "n_qualify": n_qualify, "validation": validation, "comparison": comparison,
-            "summary": summary}
+    return {"fetch_date": fetch_date, "stats": stats, "total": total, "n_unique": n_unique,
+            "n_reposts": n_reposts, "capped": capped, "capped_rules": capped_rules, "raw": raw, "muse": muse,
+            "warehouse": warehouse, "rules": rules, "support": support, "n_qualify": n_qualify,
+            "validation": validation, "comparison": comparison, "summary": summary}
+
+
+def parse_args(argv: list = None) -> argparse.Namespace:
+    """Parse the Stage 8 command-line options."""
+    parser = argparse.ArgumentParser(description="SkillMap Stage 8: The Muse live skill validation")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--new-snapshot", action="store_true",
+                       help="fetch today's snapshot from the API (live calls; cached pages are reused)")
+    group.add_argument("--fetch-date", help="process this cached snapshot (YYYY-MM-DD) instead of the latest")
+    parser.add_argument("--max-per-company", type=int, default=MAX_PER_COMPANY,
+                        help=f"postings kept per company in the capped analysis (default {MAX_PER_COMPANY}; 0 = no cap)")
+    parser.add_argument("--list-snapshots", action="store_true", help="list cached snapshots and exit")
+    return parser.parse_args(argv)
 
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    run_pipeline()
+    args = parse_args()
+    if args.list_snapshots:
+        root = find_project_root()
+        logger.info("Cached snapshots: %s", ", ".join(list_snapshots(muse_paths(root))) or "none")
+    else:
+        run_pipeline(new_snapshot=args.new_snapshot, fetch_date=args.fetch_date,
+                     max_per_company=args.max_per_company)

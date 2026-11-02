@@ -247,13 +247,19 @@ Top states and industries are chosen on the train split only.
   - 813 words and **16.2 skills per posting** (Adzuna 71 / 2.0; training 11.5). 73% published in the 90 days before the fetch
   - **Concentrated:** SpaceX 34%, Bank of America 12%, 115 companies
   - Levels map per `LEVEL_MAP` (Mid Level → Mid-Senior, Senior Level → Senior, ...). No salary
-- **Outputs:** `data/processed/muse_cleaned_jobs.csv` (extra column `publication_date`) and warehouse table `muse_job_postings` (one row per posting, `matched_skills` as a JSON array)
+- **Outputs:** `data/processed/muse_cleaned_jobs.csv` (extra column `publication_date`) and warehouse table `muse_job_postings` (one row per posting and `fetch_date`, key (id, fetch_date), `matched_skills` as a JSON array)
+- **Snapshots:** new fetches cache pages in `pages/<fetch_date>/` (the 2026-10-14 fetch is directly in `pages/`); the CSV and table upsert by `fetch_date`, so reruns are safe. Default run is cache-only; `--new-snapshot` fetches today's (live calls), `--fetch-date` picks a cached one. `load_snapshot(db, fetch_date, max_per_company)` applies the company cap (`--max-per-company`, default `MAX_PER_COMPANY` = 25, most recent first) in SQL without deleting rows
 - **Rule validation:** Apriori (≥ 2 skills, support 0.05) gives 20,599 rules; the top-lift ones are single-employer template text
   - **2 of 20 training rules confirmed** (powerpoint → excel; {development, management, organization} → leadership); company-capped at 25 per company: 1 (marketing → sales)
   - 14 of the 16 failures hit a **lift ceiling** (`muse_max_lift` = 1 / consequent share; development/design/management are in 55-62% of tech postings), and all 14 have *higher* confidence than in training
   - Takeaway: groupings persist; lift doesn't transfer from all-industry to tech-only
 - **Demand vs training tech cluster:** python 32% vs 18%; sql, c++, ci/cd, kubernetes up; agile 11% vs 17% and aws 7% vs 12% down. Manufacturing/healthcare shifts reflect the employer mix
 - **Outputs:** `08_muse_association_rules.csv`, `08_rules_validation.csv` (rule, training_lift, muse_lift, validated, plus support, confidence, max-lift, and company-capped columns), `08_skill_comparison.csv`, `08_muse_summary.txt`
+
+---
+
+### Phase 9 — Dashboard (`scripts/build_dashboard.py`)
+Run with `python scripts/build_dashboard.py` → `outputs/dashboard.html` (self-contained Plotly, ~5 MB, gitignored). Tabs: association rules, clusters, model results, live trends (by `fetch_date` once ≥ 2 Muse snapshots exist). Reads every number from `skillmap.db` and `outputs/`; hard-codes no metric.
 
 ---
 

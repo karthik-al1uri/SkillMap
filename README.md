@@ -92,14 +92,25 @@ cp .env.example .env
 
 `.env` is gitignored: never commit it. The Adzuna free tier allows only 25 calls, so `src/live_pipeline.py` logs every call in `data/raw/adzuna_live/api_calls.json` before sending it and refuses to go past 25. Pages are cached, so reruns and the notebook make no further calls.
 
-Stage 8 needs no key. It caches every page in `data/raw/muse_live/pages/` and retries network errors and HTTP 429/5xx with backoff.
+Stage 8 needs no key. Each fetch is a snapshot keyed by `fetch_date`: pages are cached in `data/raw/muse_live/pages/<fetch_date>/` (the first fetch, 2026-10-14, sits directly in `pages/`), and `muse_cleaned_jobs.csv` and the `muse_job_postings` table keep one set of rows per snapshot. Rerunning a snapshot replaces only its own rows. Analysis runs on one snapshot, and the company-capped repeat keeps at most `--max-per-company` postings per employer (most recent first) through a SQL query; no rows are deleted.
 
 ```bash
-python -m src.live_pipeline    # Stage 7 (uses the cache once fetched)
-python -m src.muse_pipeline    # Stage 8
+python -m src.live_pipeline                    # Stage 7 (uses the cache once fetched)
+python -m src.muse_pipeline                    # Stage 8, latest cached snapshot, no API calls
+python -m src.muse_pipeline --new-snapshot     # Stage 8, fetch today's snapshot (live API calls)
+python -m src.muse_pipeline --list-snapshots   # cached snapshots
+python -m src.muse_pipeline --fetch-date 2026-10-14 --max-per-company 50
 ```
 
-`python -m src.warehouse` rebuilds `skillmap.db` from scratch and drops the live tables. Re-run the two commands above to restore them from the cache without any API calls.
+`python -m src.warehouse` rebuilds `skillmap.db` from scratch and drops the live tables. Re-run the two commands above to restore them from the cache without any API calls (Stage 8 reloads every snapshot in `muse_cleaned_jobs.csv`).
+
+### Dashboard
+
+```bash
+python scripts/build_dashboard.py              # writes outputs/dashboard.html
+```
+
+One self-contained HTML file (open it in a browser, works offline) with four tabs: association rules, clusters, model results, and live trends. It reads `skillmap.db` and the stage outputs, so run Stages 3-8 first. The skill-share-by-fetch-date chart appears once the warehouse holds two or more Muse snapshots.
 
 ---
 

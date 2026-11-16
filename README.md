@@ -13,6 +13,14 @@ The full write-up is in [`outputs/final_report.md`](outputs/final_report.md).
 
 ---
 
+## Bounded validation status
+
+The saved November 1 results are historical exploratory results, not a newly reproduced evaluation. The original classifier test split influenced model-family selection; its scores must not be described as an untouched final evaluation. Current saved values are 62 general rules, 436,441 warehouse fact rows, 11.1 extracted skills per training job, classifier macro F1 0.7273 / ROC-AUC 0.8921, and 1/20 Muse confirmations. A company cap confirms a different rule, also 1/20.
+
+The current implementation pass preserves existing data, snapshots, models, reports, and saved outputs. Do not run the historical end-to-end commands below against canonical artifacts during this pass: several overwrite outputs, and the warehouse builder replaces the database. Any new evaluation must select models using training-only cross-validation and fit learned preprocessing within each fold. Reusing these data does not create an independent external test.
+
+The live snapshots were fetched on October 14, 2026. Cross-source skill-share differences do not establish temporal market trends. A lift ceiling above the 1.5 acceptance threshold does not make passing mathematically impossible. Weak clustering scores describe the tested methods and representations, not an impossibility theorem.
+
 ## Datasets
 
 The raw data is **not included in this repository** because the files are up to 4.8 GB. Download each Kaggle dataset and unzip it into the folder shown.
@@ -43,13 +51,13 @@ data/raw/
 | Stage | What it does | Code | Key result |
 |---|---|---|---|
 | 1 | Ingestion: profile all 15 raw tables | `notebooks/01_data_ingestion.ipynb` | `outputs/01_summary.txt` |
-| 2 | Preprocessing: join, annualize and filter salaries, drop reposts, tier at the 33rd/66th percentiles, regex-match 245 skills in descriptions | `src/preprocessing.py` | 34,179 jobs; Low ≤ $62,400 < Mid ≤ $109,200 < High; 11.5 skills per job |
-| 3 | Warehousing: SQLite star schema, (job, skill) fact table, `v_jobs` view, OLAP queries | `src/warehouse.py` | `data/processed/skillmap.db`, 449,665 fact rows |
-| 4 | Association mining: Apriori (support 0.05, confidence > 0.5, lift > 1.5), High-tier rules, co-occurrence network, 0.02-support technical pass | `src/association.py` | 91 rules; {python, engineering} jobs are 81% High tier (2.4× baseline); aws + python 88% High |
-| 5 | Classification: Logistic Regression, Random Forest, XGBoost, tuned XGBoost + title/company TF-IDF, plus two ordinal models | `src/classification.py` | Best macro F1 **0.728** (target 0.75 ✗), ROC-AUC **0.891** (target 0.80 ✓); ordinal models don't help |
-| 6 | Clustering: K-Means, DBSCAN, t-SNE vs PCA, Isolation Forest outliers | `src/clustering.py` | Silhouette ≤ 0.21 (target 0.50 ✗): skills form a continuum. A tech cluster earns $50k more than service roles; outliers are skill-dense postings |
+| 2 | Preprocessing: join, annualize and filter salaries, drop reposts, tier at the 33rd/66th percentiles, regex-match 245 skills in descriptions | `src/preprocessing.py` | 34,179 jobs; Low ≤ $62,400 < Mid ≤ $109,200 < High; 11.1 skills per job |
+| 3 | Warehousing: SQLite star schema, (job, skill) fact table, `v_jobs` view, OLAP queries | `src/warehouse.py` | `data/processed/skillmap.db`, 436,441 fact rows |
+| 4 | Association mining: Apriori (support 0.05, confidence > 0.5, lift > 1.5), High-tier rules, co-occurrence network, 0.02-support technical pass | `src/association.py` | 62 rules; {python, engineering} jobs are 81% High tier (2.4× baseline); aws + python 88% High |
+| 5 | Classification: Logistic Regression, Random Forest, XGBoost, tuned XGBoost + title/company TF-IDF, plus two ordinal models | `src/classification.py` | Best macro F1 **0.7273** (target 0.75 ✗), ROC-AUC **0.8921** (target 0.80 ✓); ordinal models don't help |
+| 6 | Clustering: K-Means, DBSCAN, t-SNE vs PCA, Isolation Forest outliers | `src/clustering.py` | Silhouette ≤ 0.192 (target 0.50 ✗): the tested methods and representations showed weak cluster separation. A tech cluster earns $50k more than service roles; outliers are skill-dense postings |
 | 7 | Live data (Adzuna): fetch, preprocess, warehouse, re-test rules and model | `src/live_pipeline.py` | 1,150 IT postings, but ~500-character snippets give only 2.0 skills each, too few to test rules |
-| 8 | Live skill validation (The Muse): full descriptions, rule validation, skill-demand comparison | `src/muse_pipeline.py` | 16.2 skills per posting; 2 of 20 training rules confirmed, most others hit a lift ceiling with *higher* confidence; Python demand in tech postings 18% → 32% |
+| 8 | Live skill validation (The Muse): full descriptions, rule validation, skill-demand comparison | `src/muse_pipeline.py` | 15.6 skills per posting; 1 of 20 training rules confirmed; Python appears in 17.3% of the training tech cluster and 31.8% of Muse postings (different populations) |
 
 Each stage has a notebook (`notebooks/0N_*.ipynb`) with executed outputs and a module that runs it end to end with `python -m src.<module>`. Summaries are written to `outputs/0N_summary.txt`.
 
@@ -73,7 +81,7 @@ Download the three Kaggle datasets into `data/raw/` (see above), then run the st
 python -m src.preprocessing    # Stage 2, ~8 min
 python -m src.warehouse        # Stage 3
 python -m src.association      # Stage 4
-python -m src.classification   # Stage 5, ~2.5 min
+python -m src.classification --output-dir /tmp/new-skillmap-evaluation  # Stage 5; training requires separate approval
 python -m src.clustering       # Stage 6, ~1.5 min
 ```
 
@@ -96,10 +104,9 @@ Stage 8 needs no key. Each fetch is a snapshot keyed by `fetch_date`: pages are 
 
 ```bash
 python -m src.live_pipeline                    # Stage 7 (uses the cache once fetched)
-python -m src.muse_pipeline                    # Stage 8, latest cached snapshot, no API calls
-python -m src.muse_pipeline --new-snapshot     # Stage 8, fetch today's snapshot (live API calls)
+python -m src.muse_pipeline --output-dir /tmp/new-muse-review  # Stage 8, cache only
 python -m src.muse_pipeline --list-snapshots   # cached snapshots
-python -m src.muse_pipeline --fetch-date 2026-10-14 --max-per-company 50
+python -m src.muse_pipeline --fetch-date 2026-10-14 --max-per-company 50 --output-dir /tmp/new-muse-capped-review
 ```
 
 `python -m src.warehouse` rebuilds `skillmap.db` from scratch and drops the live tables. Re-run the two commands above to restore them from the cache without any API calls (Stage 8 reloads every snapshot in `muse_cleaned_jobs.csv`).
@@ -107,10 +114,15 @@ python -m src.muse_pipeline --fetch-date 2026-10-14 --max-per-company 50
 ### Dashboard
 
 ```bash
-python scripts/build_dashboard.py              # writes outputs/dashboard.html
+# Generate artifact-derived facts into a fresh external file (no training).
+python -m scripts.build_dashboard_facts --root . --out /tmp/new-skillmap-facts.json
+python scripts/build_dashboard.py --facts /tmp/new-skillmap-facts.json --out /tmp/new-skillmap-dashboard.html
+python scripts/verify_dashboard.py --html /tmp/new-skillmap-dashboard.html --out /tmp/new-skillmap-verification.json
 ```
 
-One self-contained HTML file (open it in a browser, works offline) with four tabs: association rules, clusters, model results, and live trends. It reads `skillmap.db` and the stage outputs, so run Stages 3-8 first. The skill-share-by-fetch-date chart appears once the warehouse holds two or more Muse snapshots.
+One self-contained HTML file with six views: Overview, Skills, Salary, Clusters, Live, and Model. The renderer reads only the generated facts JSON; no database connection, API call, or training occurs. Every value has artifact provenance. Missing optional evaluations appear as unavailable rather than being replaced with historical results. Salary summaries use one row per job.
+
+To include the completed isolated evaluations, pass their directories to the facts generator using `--rule-views`, `--grouped`, `--live-validation`, `--cluster-robustness`, and `--salary-quality`. The grouped model is selected using training CV metadata. Historical exploratory results and dated cached live validation remain separately labeled; one snapshot does not establish temporal trends. See [offline verification instructions](docs/offline_reproducibility.md) for installed-environment checks and a data-free source export. Python 3.12 CI and clean dependency installation remain unverified until actually run.
 
 ---
 

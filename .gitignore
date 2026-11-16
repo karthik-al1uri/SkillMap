@@ -8,6 +8,10 @@ outputs/*
 !outputs/phase6_before_after.md
 *.csv
 *.json
+!frontend/package.json
+!frontend/package-lock.json
+!frontend/tsconfig.json
+!assets/final_report_format/figures/grouped_confusion_source.json
 
 # Secrets — real API credentials live only in .env (template: .env.example)
 .env

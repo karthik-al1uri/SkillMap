@@ -1,5 +1,13 @@
 # CLAUDE.md — SkillMap Project
 
+## Current implementation contract
+
+Never add Co-Authored-By trailers. Do not commit progress_report.md or new data/output artifacts. Existing tracked historical reports remain unchanged pending a separate tracking-policy decision.
+
+The detailed stage narratives below include historical pre-fix metrics. Use the artifact-derived facts generator for current values; do not copy historical numbers into new deliverables. The November 1 saved classifier scores are exploratory because model-family selection used the test split. All new selection must use training CV with fold-contained preprocessing; label any reused-data evaluation honestly.
+
+During bounded implementation, canonical data/, outputs/, databases, snapshots and model artifacts are read-only. Use explicit fresh isolated output paths. No network requests, API fetches, installations, heavy training or Git-history changes without separate approval. Do not run the warehouse rebuild or the historical pipeline commands below against canonical artifacts.
+
 ## Overview
 You are helping build **SkillMap** — a data mining pipeline that analyzes large-scale job posting data to answer three core questions:
 1. Which skills consistently appear together and predict higher compensation?

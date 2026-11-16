@@ -1,0 +1,35 @@
+{
+  "labels": [
+    "Low",
+    "Mid",
+    "High"
+  ],
+  "confusion_matrix": [
+    [
+      1901,
+      328,
+      78
+    ],
+    [
+      524,
+      1206,
+      526
+    ],
+    [
+      147,
+      442,
+      1684
+    ]
+  ],
+  "assessment_jobs": 6836,
+  "training_jobs": 27343,
+  "protocol": "corrected exploratory description-grouped outer-fold0, fixed XGBoost selected by original training CV; probabilities reconstructed and saved in Phase2; no refitting now",
+  "source_files": {
+    "mid_outer_predictions.npz": "b699e512037fdc890fd468a4c89eeebcc594fb474f9c3009dd9058de145f927b",
+    "mid_nested_folds.csv": "98197c04089c256b0fa88c1548cfbc6320b74777c85dbadb648470928302acb1",
+    "mid_description_groups.csv": "be93455a41c8c8049ddc999725fb02b04177cd813f6c76cc4a9efb83f821fa43",
+    "protocol.json": "d242ab4b2487f13a089916d9995f0f8585c7547706c0870e59e7831401249aaf",
+    "experiment.py": "a5222da6d80e263c37ea703b48a64807a482491be45132cccd5e53eaeb0ade95"
+  },
+  "note": "Figure counts are independent of the failed multiplier candidate; use saved unadjusted baseline predictions for outer fold0. Source array row order reconciled to canonical job IDs. No model fitting during final validation."
+}

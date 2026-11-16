@@ -1,0 +1,35 @@
+import { useMemo, useState } from 'react';
+import type { ProductData } from '../data/types';
+import Chart, { chartBase, colors } from '../components/Chart';
+import { median, salaryHistogram } from '../data/logic';
+import { Badge, EmptyState, PageHeading, Panel, formatMoney, formatNumber, formatPercent } from '../components/UI';
+export default function Overview({ data }: { data: ProductData }) {
+  const [focus, setFocus] = useState<number | null>(null);
+  const cohort = useMemo(() => focus == null ? data.rows : data.rows.filter(row => row[1] === focus), [data.rows, focus]);
+  const skills = useMemo(() => {
+    const counts = new Map<number, number>();
+    for (const row of cohort) for (const index of row[3]) counts.set(index, (counts.get(index) ?? 0) + 1);
+    return [...counts].sort((a,b) => b[1]-a[1]).slice(0,8).reverse().map(([index,count]) => ({name:data.skills[index].name,count,index}));
+  }, [cohort, data.skills]);
+  const salaries = useMemo(() => cohort.map(row => row[0]).sort((a,b) => a-b), [cohort]);
+  const upper = salaries[Math.floor((salaries.length-1)*.95)];
+  const histogram = useMemo(() => salaryHistogram(cohort, 22, salaries.length && salaries[0] < upper ? [salaries[0],upper] : undefined), [cohort,salaries,upper]);
+  return <div className="page overview-page"><PageHeading eyebrow="THE SAVED JOB LANDSCAPE" title="Find the signal in the skills." description="A connected view of job profiles, capabilities, and compensation."><Badge>Historical cohort</Badge></PageHeading>
+    <a className="market-entry-banner" href="/app/live"><span>MARKET INTELLIGENCE</span><strong>What appears in the latest available postings?</strong><small>Explore cached Adzuna & The Muse snapshots ↗</small></a>
+    <div className="overview-intro"><div><span className="eyebrow">YOUR EVIDENCE BASE</span><strong>{formatNumber(data.metrics.n_jobs)}<span>saved jobs</span></strong></div><p><b>{formatNumber(data.metrics.n_skills_vocab)}</b> observed capabilities<br/><b>{formatMoney(data.metrics.median_salary)}</b> median annual salary</p><div className="intro-note">Historical observations<br/><span>Explore the cohort. Inspect the evidence.</span></div></div>
+    {data.rows.length ? <>
+      <div className="overview-layout"><Panel title="The shape of the job landscape" description="Saved archetype assignments · select a profile to focus the view" action={focus != null ? <button className="text-button" onClick={() => setFocus(null)}>Clear focus</button> : undefined}>
+        <div className="family-composition" role="group" aria-label="Job-family composition">{data.roles.map((role,index) => <button key={role.id} type="button" aria-pressed={focus === index} onClick={() => setFocus(focus === index ? null : index)} className="family-row"><span className="family-label"><i style={{background:colors.palette[index%colors.palette.length]}}/>{role.name}</span><span className="family-meta"><strong>{formatNumber(role.count)}</strong><span>{formatPercent(role.count/data.rows.length)}</span></span><span className="family-track" aria-hidden="true"><i style={{width:`${role.count/data.rows.length*100}%`,background:colors.palette[index%colors.palette.length]}}/></span><small>{formatMoney(role.median_salary)} median annual pay</small></button>)}</div>
+        <p className="subtle">Exploratory profiles overlap in capability. They are not validated natural job categories.</p>
+      </Panel><Panel title="Frequently observed capabilities" description={focus == null ? 'Top eight · all saved jobs' : `Top eight · ${data.roles[focus].name}`}>
+        <Chart ariaLabel="Most frequently mentioned skills" height={350} option={chartBase({grid:{left:6,right:55,top:12,bottom:15,containLabel:true}, yAxis:{type:'category',data:skills.map(skill=>skill.name),axisLabel:{color:colors.text,fontSize:13}},xAxis:{type:'value',axisLabel:{formatter:value=>`${Math.round(Number(value)/Math.max(1,cohort.length)*100)}%`}},tooltip:{trigger:'axis',renderMode:'richText',valueFormatter:value=>`${formatNumber(Number(value))} jobs · ${formatPercent(Number(value)/Math.max(1,cohort.length))}`},series:[{type:'bar',data:skills.map(skill=>skill.count),barMaxWidth:12,itemStyle:{color:colors.accent,borderRadius:[0,4,4,0]},label:{show:true,position:'right',color:colors.text,formatter:event=>formatNumber(Number(event.value))}}]})}/>
+      </Panel></div>
+      <Panel className="overview-distribution" title="Where compensation concentrates" description={`${formatNumber(cohort.length)} unique jobs · ${focus == null ? 'full cohort' : data.roles[focus].name}`} action={<span className="inline-metric">{formatMoney(median(salaries))}<small>selection median</small></span>}>
+        <Chart ariaLabel="Overview salary distribution" height={230} option={chartBase({grid:{left:10,right:20,top:10,bottom:20,containLabel:true},xAxis:{type:'category',data:histogram.counts.map((_,index)=>`${formatMoney(histogram.edges[index])} – ${formatMoney(histogram.edges[index+1])}`),axisLabel:{hideOverlap:true,formatter:(_value,index)=>formatMoney(histogram.edges[index])}},yAxis:{type:'value',minInterval:1},tooltip:{trigger:'axis',valueFormatter:value=>`${formatNumber(Number(value))} unique jobs`},series:[{type:'bar',data:histogram.counts,barCategoryGap:'15%',itemStyle:{color:colors.palette[1],borderRadius:[3,3,0,0]}}]})}/>
+        <div className="chart-caption"><span>Through the 95th percentile · {formatNumber(histogram.overflow)} higher-pay observations outside this view</span><a href="/app/salary">Inspect full salary range →</a></div>
+      </Panel>
+    </> : <EmptyState title="Historical job cohort unavailable" description="Supply the approved facts bundle to explore job-level skills and salary."/>}
+    <div className="evidence-links">{[['/app/skills','01','Follow the connections','Explore skill connections'],['/app/salary','02','Put pay in context','Compare observed salaries'],['/app/live','03','Explore the latest snapshot','Open Live Market']].map(([key,index,title,label])=><a href={key} key={key}><small>{index} / {key === '/app/live' ? 'LIVE MARKET' : key.split('/').at(-1)?.toUpperCase()}</small><strong>{title}</strong><span>{label} ↗</span></a>)}</div>
+    <details className="detail-disclosure"><summary>Chart values & evidence scope</summary><p>Historical observations describe this saved cohort. Market snapshots cover different saved posting populations and cannot establish time trends.</p><table><caption>Skill mentions in the selected population</caption><thead><tr><th>Skill</th><th>Jobs</th></tr></thead><tbody>{[...skills].reverse().map(skill=><tr key={skill.index}><th>{skill.name}</th><td>{formatNumber(skill.count)}</td></tr>)}</tbody></table><table><caption>Salary distribution in the selected population</caption><thead><tr><th>Annual USD range</th><th>Jobs</th></tr></thead><tbody>{histogram.counts.map((count,index)=><tr key={index}><th>{formatMoney(histogram.edges[index])} – {formatMoney(histogram.edges[index+1])}</th><td>{formatNumber(count)}</td></tr>)}</tbody></table><p>{formatNumber(histogram.overflow)} observations above the displayed range.</p></details>
+  </div>;
+}

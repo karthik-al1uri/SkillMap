@@ -1,0 +1,23 @@
+import {createHash} from 'node:crypto';
+import {readFileSync} from 'node:fs';
+import {describe,expect,it} from 'vitest';
+import {validateData,median} from '../data/logic';
+import {cohort,defaults,defaultTitle,quantile,readSelection,selectionUrl,titleGroups,validatePlaygroundData} from './data';
+const raw=readFileSync('public/data/skillmap.json');const data=validateData(JSON.parse(raw.toString()));const metadata=validatePlaygroundData(JSON.parse(readFileSync('public/data/playground.json','utf8')),data);
+describe('playground verified title evidence',()=>{
+ it('retains all unique jobs including unclassified navigation records',()=>{expect(metadata.jobs).toHaveLength(34179);expect(new Set(metadata.jobs.map(job=>job.id)).size).toBe(34179);expect(data.roles.filter(role=>role.name!=='No matched skills').reduce((sum,role)=>sum+role.count,0)).toBeLessThan(data.rows.length);expect(metadata.provenance.product_sha256).toBe(createHash('sha256').update(raw).digest('hex'));});
+ it('uses a stable job-title default with sufficient observations',()=>{expect(defaultTitle(data,metadata)).toBe('software engineer');const group=titleGroups(data,metadata).find(group=>group.title==='software engineer')!;expect(group.indices.length).toBe(60);const selected=cohort(data,metadata,{...defaults,title:group.title});expect(selected.rows).toHaveLength(60);expect(median(group.salaries)).toBe(median(selected.rows.map(row=>row[0])));});
+ it('preserves title totals at unique-job grain',()=>{expect(titleGroups(data,metadata).reduce((sum,group)=>sum+group.indices.length,0)).toBe(data.rows.length);});
+ it('rejects mismatched or duplicate metadata',()=>{const copy=structuredClone(metadata);copy.jobs[0].id=copy.jobs[1].id;expect(()=>validatePlaygroundData(copy,data)).toThrow();copy.jobs.pop();expect(()=>validatePlaygroundData(copy,data)).toThrow();});
+ it('computes observed percentiles without generating observations',()=>{expect(quantile([10,20,30],.5)).toBe(20);expect(quantile([], .5)).toBeNull();});
+ it('roundtrips shareable selections without mixing market and historical locations',()=>{const selection={...defaults,section:'profiles' as const,title:'software engineer',skill:'python',location:'Boulder',marketLocation:'London',company:'Example'};window.history.replaceState(null,'',selectionUrl(selection));expect(readSelection()).toEqual(selection);});
+});
+
+import {chooseFeaturedTitle,FEATURED_TITLE_POOL,MIN_SALARY_JOBS,relatedTitleGroups,RELATED_TITLE_MIN_JOBS,RELATED_TITLE_MIN_JACCARD,skillNeighborhood} from './data';
+import type {JobRow} from '../data/types';
+import {productFixture} from '../__tests__/fixtures';
+describe('approved evidence thresholds',()=>{
+ it('features only real eligible titles and never changes observed salary values',()=>{const before=JSON.stringify(data.rows);for(const value of [0,.25,.5,.999]){const title=chooseFeaturedTitle(data,metadata,()=>value);expect(FEATURED_TITLE_POOL).toContain(title);expect(titleGroups(data,metadata).find(group=>group.title===title)!.indices.length).toBeGreaterThanOrEqual(MIN_SALARY_JOBS);}expect(JSON.stringify(data.rows)).toBe(before);expect(chooseFeaturedTitle(data,null,()=>0)).toBe('');});
+ it('ranks skill relationships by Jaccard rather than raw co-occurrence count',()=>{const fixture=productFixture();fixture.skills[0].count=10;fixture.skills[1].count=100;fixture.skills[2].count=6;fixture.rows=[...Array.from({length:10},(_,index)=>[100,0,0,[0,...(index<8?[1]:[]),...(index<5?[2]:[])],1] as JobRow),...Array.from({length:92},()=>[100,0,0,[1],1] as JobRow),[100,0,0,[2],1]];const neighbors=skillNeighborhood(fixture,0);expect(neighbors[0]).toMatchObject({index:2,count:5});expect(neighbors[0].jaccard).toBeCloseTo(5/11);expect(neighbors[1]).toMatchObject({index:1,count:8});});
+ it('requires enough jobs, shared prevalent skills and minimum overlap for related titles',()=>{const fixture=productFixture();const definitions=[{title:'selected',n:30,skills:[0,1]},{title:'qualified',n:30,skills:[0,1,2]},{title:'too small',n:24,skills:[0,1]},{title:'one shared',n:30,skills:[0,3]}];fixture.rows=[];const groups=definitions.map(item=>{const start=fixture.rows.length;fixture.rows.push(...Array.from({length:item.n},()=>[100,0,0,item.skills,1] as JobRow));return{title:item.title,indices:Array.from({length:item.n},(_,index)=>start+index),salaries:Array(item.n).fill(100) as number[]};});const related=relatedTitleGroups(fixture,groups,'selected');expect(related.map(item=>item.title)).toEqual(['qualified']);expect(related.every(group=>group.indices.length>=RELATED_TITLE_MIN_JOBS&&group.jaccard>=RELATED_TITLE_MIN_JACCARD)).toBe(true);});
+});

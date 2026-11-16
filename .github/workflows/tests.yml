@@ -1,0 +1,23 @@
+name: Offline unit and smoke tests
+on: [push, pull_request]
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      MPLBACKEND: Agg
+      MPLCONFIGDIR: /tmp/skillmap-matplotlib
+      OMP_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      NUMEXPR_NUM_THREADS: "1"
+      VECLIB_MAXIMUM_THREADS: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install declared test environment
+        run: python -m pip install -r requirements-test.txt
+      - name: Check installed dependencies and run guarded offline tests
+        run: python -B -m scripts.check_offline_environment --root "$GITHUB_WORKSPACE" --out-dir "$RUNNER_TEMP/skillmap-offline-check" --pytest

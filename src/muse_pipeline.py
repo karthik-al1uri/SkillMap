@@ -4,7 +4,7 @@ Stage 7's Adzuna descriptions were ~500-character snippets (2.0 skills per posti
 to test skill co-occurrence. The Muse public API returns full HTML descriptions without an API
 key. This stage fetches current tech postings, extracts skills with the Stage 2 matcher, loads
 them into the warehouse, checks which Stage 4 association rules still hold, and compares skill
-demand with the 2023-2024 training data.
+shares with the 2023-2024 training data.
 
 API notes (found when probing the API on 2026-10-14):
   - Network errors and HTTP 429/5xx are retried with exponential backoff (honouring
@@ -31,14 +31,14 @@ Company cap: analysis queries keep at most `max_per_company` postings per compan
 (most recent first); no rows are deleted.
 
 Run from the project root with:
-    python -m src.muse_pipeline                       # latest cached snapshot, no API calls
-    python -m src.muse_pipeline --new-snapshot        # fetch today's snapshot (live API calls)
-    python -m src.muse_pipeline --fetch-date 2026-10-14 --max-per-company 50
+    python -m src.muse_pipeline --output-dir /tmp/new-muse-review  # cache only
+    python -m src.muse_pipeline --fetch-date 2026-10-14 --max-per-company 50 --output-dir /tmp/new-muse-review
 """
 import argparse
 import json
 import logging
 import re
+import shutil
 import sqlite3
 import time
 from ast import literal_eval
@@ -141,6 +141,36 @@ def muse_paths(root: Path) -> dict:
         "cleaned": root / "data" / "processed" / "muse_cleaned_jobs.csv",
         "db": root / "data" / "processed" / "skillmap.db",
     }
+
+
+def prepare_run_paths(root: Path, output_dir: Path):
+    """Copy snapshot state into a fresh external run; canonical inputs stay read-only."""
+    root = Path(root).resolve()
+    if output_dir is None:
+        raise ValueError("An explicit fresh external output_dir is required")
+    out = Path(output_dir).resolve()
+    if out == root or root in out.parents:
+        raise ValueError("output_dir must be outside the input repository")
+    if out.exists():
+        raise FileExistsError(f"Use a new run directory: {out}")
+    out.mkdir(parents=True)
+    original = muse_paths(root)
+    paths = muse_paths(out)
+    paths["raw_dir"].mkdir(parents=True)
+    # Preserve cached pages and fetch metadata, including legacy date resolution.
+    if original["pages_dir"].exists():
+        shutil.copytree(original["pages_dir"], paths["pages_dir"])
+    if original["fetch_log"].exists():
+        shutil.copy2(original["fetch_log"], paths["fetch_log"])
+    paths["cleaned"].parent.mkdir(parents=True)
+    if original["cleaned"].exists():
+        shutil.copy2(original["cleaned"], paths["cleaned"])
+    if original["db"].exists():
+        # SQLite backup includes committed WAL content without changing the source.
+        with sqlite3.connect(original["db"].resolve().as_uri() + "?mode=ro", uri=True) as source:
+            with sqlite3.connect(paths["db"]) as target:
+                source.backup(target)
+    return paths, out
 
 
 def legacy_fetch_date(paths: dict):
@@ -476,7 +506,7 @@ def load_into_warehouse(muse: pd.DataFrame, db_path: Path) -> dict:
 
 def warehouse_snapshots(db_path: Path) -> list:
     """Sorted fetch_dates in muse_job_postings (empty if the table does not exist)."""
-    with sqlite3.connect(db_path) as conn:
+    with sqlite3.connect(db_path.resolve().as_uri() + "?mode=ro", uri=True) as conn:
         if not conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'muse_job_postings'").fetchone():
             return []
         return [r[0] for r in conn.execute("SELECT DISTINCT fetch_date FROM muse_job_postings ORDER BY 1")]
@@ -488,7 +518,7 @@ def load_snapshot(db_path: Path, fetch_date: str = None, max_per_company: int = 
     """
     fetch_date = fetch_date or warehouse_snapshots(db_path)[-1]
     cap = max_per_company or None
-    with sqlite3.connect(db_path) as conn:
+    with sqlite3.connect(db_path.resolve().as_uri() + "?mode=ro", uri=True) as conn:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(muse_job_postings)")}
         order = "publication_date DESC, id" if "publication_date" in columns else "id"   # pre-migration table
         df = pd.read_sql_query(SNAPSHOT_SQL.format(order=order), conn, params=(fetch_date, cap, cap))
@@ -513,14 +543,17 @@ def mine_muse_rules(muse: pd.DataFrame) -> tuple:
 
 
 def validate_rules(train_rules: pd.DataFrame, muse_rules: pd.DataFrame, onehot: pd.DataFrame,
-                   capped_rules: pd.DataFrame = None, capped_onehot: pd.DataFrame = None) -> pd.DataFrame:
+                   capped_rules: pd.DataFrame = None, capped_onehot: pd.DataFrame = None,
+                   min_support: float = MIN_SUPPORT) -> pd.DataFrame:
     """Check each Stage 4 training rule against the Muse data.
 
     validated = the rule is among the Muse rules (passes min_support, confidence, and lift filters).
     lift_holds = on Muse data the rule still has confidence > 0.5 and lift > 1.5, ignoring support.
     muse_max_lift = 1 / support of the consequent in Muse data: the highest lift the rule could
     reach. A consequent in most postings caps lift near 1, whatever the co-occurrence.
-    muse_lift etc. are taken from the Muse rules when present, otherwise computed directly.
+    Metrics and threshold diagnostics are computed directly, before rounding.
+    A ceiling blocks the strict lift threshold only when it is <= MIN_LIFT.
+    min_support must be the support actually used for mining this sample.
     With `capped_rules` / `capped_onehot`, the same check is repeated on the company-capped sample.
     """
     def lookup(rules: pd.DataFrame) -> dict:
@@ -538,15 +571,28 @@ def validate_rules(train_rules: pd.DataFrame, muse_rules: pd.DataFrame, onehot: 
     for t in train_rules.itertuples(index=False):
         key = rule_key(t.antecedents, t.consequents)
         found = muse.get(key)
-        m = metrics(found, onehot, t.antecedents, t.consequents)
+        m = rule_metrics(onehot, t.antecedents, t.consequents)
         cons = [x.strip() for x in t.consequents.split(",")]
         cons_support = onehot[cons].all(axis=1).mean() if all(c in onehot for c in cons) else np.nan
+        max_lift = 1 / cons_support if pd.notna(cons_support) and cons_support > 0 else np.nan
+        support_holds = bool(m["support"] >= min_support)
+        confidence_holds = bool(m["confidence"] > assoc.MIN_CONFIDENCE)
+        lift_threshold_holds = bool(m["lift"] > assoc.MIN_LIFT)
+        measurable = all(pd.notna(m[k]) for k in ("support", "confidence", "lift"))
+        failures = [name for name, holds in [("support", support_holds),
+                    ("confidence", confidence_holds), ("lift", lift_threshold_holds)] if not holds]
         row = {
             "rule": key, "training_lift": t.lift, "muse_lift": m["lift"], "validated": found is not None,
             "training_support": t.support, "muse_support": m["support"],
             "training_confidence": t.confidence, "muse_confidence": m["confidence"],
             "muse_consequent_support": cons_support,
-            "muse_max_lift": 1 / cons_support if cons_support else np.nan,
+            "muse_max_lift": max_lift,
+            "min_support": min_support,
+            "support_holds": support_holds,
+            "confidence_holds": confidence_holds,
+            "lift_threshold_holds": lift_threshold_holds,
+            "failure_reasons": ", ".join(failures) if measurable else "not measurable",
+            "lift_ceiling_blocks_threshold": bool(max_lift <= assoc.MIN_LIFT),
             "lift_holds": bool(m["confidence"] > assoc.MIN_CONFIDENCE and m["lift"] > assoc.MIN_LIFT)
             if pd.notna(m["lift"]) else False,
         }
@@ -588,7 +634,7 @@ def skill_comparison(muse: pd.DataFrame, train: pd.DataFrame, tech_ids: set,
 
 
 def demand_shifts(comparison: pd.DataFrame, n: int = TOP_SHIFTS, min_share: float = 0.05) -> tuple:
-    """Return the n largest rises and n largest drops vs training tech jobs, among skills in >= min_share
+    """Return the n largest positive and negative share differences vs training tech jobs, among skills in >= min_share
     of postings in either source."""
     common = comparison[(comparison["muse_share"] >= min_share) | (comparison["train_tech_share"] >= min_share)]
     ranked = common.sort_values("change_vs_tech_pp")
@@ -613,10 +659,11 @@ def key_finding(validation: pd.DataFrame, shifts: tuple, muse: pd.DataFrame, top
     n, validated = len(validation), int(validation["validated"].sum())
     capped = int(validation["validated_company_capped"].sum())
     confirmed = validation[validation["validated"]].sort_values("muse_lift", ascending=False)["rule"]
-    failed = validation[~validation["lift_holds"]]
-    ceiling = failed[failed["muse_max_lift"] < 2]
-    conf_up = (ceiling["muse_confidence"] > ceiling["training_confidence"]).sum()
-    ceiling_skills = sorted({r.split(" -> ")[1] for r in ceiling["rule"]})
+    failed = validation[~validation["validated"]]
+    blocked = failed[failed["lift_ceiling_blocks_threshold"]]
+    headroom = failed[(failed["muse_max_lift"] > assoc.MIN_LIFT)
+                      & (failed["muse_max_lift"] < 2)]
+    conf_up = (headroom["muse_confidence"] > headroom["training_confidence"]).sum()
     recent = (pd.to_datetime(muse["publication_date"]) >= pd.Timestamp(muse["fetch_date"].iloc[0])
               - pd.Timedelta(days=90)).mean()
     rises, drops = shifts
@@ -625,13 +672,16 @@ def key_finding(validation: pd.DataFrame, shifts: tuple, muse: pd.DataFrame, top
         f"them published in the 90 days before the fetch ({capped} of {n} with at most {cap} postings "
         f"per company): "
         f"{', '.join(confirmed) if len(confirmed) else 'none'}.",
-        f"Most of the rest did not break: {len(ceiling)} of the {len(failed)} failing rules point to skills "
-        f"({', '.join(ceiling_skills)}) so common in tech postings that their lift is capped below 2, "
-        f"and {conf_up} of those {len(ceiling)} actually have higher confidence than in training, so the skills "
-        f"still co-occur but are no longer distinctive in a tech-only sample.",
-        f"Skill demand vs training tech jobs rose most for {', '.join(rises['skill'])} and fell for "
-        f"{', '.join(drops['skill'])}, but the sample is concentrated ({top_share[0]} is {top_share[1]:.0%} of postings), "
-        f"so shifts are indicative only.",
+        f"Of {len(failed)} unconfirmed rules, {len(blocked)} cannot exceed the lift threshold "
+        f"of {assoc.MIN_LIFT} because their maximum possible lift is at or below it. "
+        f"Another {len(headroom)} have ceilings above {assoc.MIN_LIFT} but below 2: this reduces "
+        f"headroom without making confirmation impossible. {conf_up} of these have higher "
+        "confidence than in training; higher confidence alone does not establish transfer. "
+        "Support, confidence and lift failures are reported separately in the validation table.",
+        f"Muse skill shares are higher than training tech jobs for {', '.join(rises['skill'])} and lower for "
+        f"{', '.join(drops['skill'])}. Source and employer differences "
+        f"({top_share[0]} is {top_share[1]:.0%} of postings) prevent attributing these differences "
+        "to temporal market demand changes.",
     ])
 
 
@@ -700,12 +750,13 @@ def build_summary(fetch_date: str, stats: pd.DataFrame, total: int, n_unique: in
         "",
         "All training rules:",
         validation[["rule", "training_lift", "muse_lift", "muse_max_lift", "training_confidence", "muse_confidence",
-                    "validated", "validated_company_capped"]].to_string(index=False),
+                    "validated", "validated_company_capped", "failure_reasons",
+                    "lift_ceiling_blocks_threshold"]].to_string(index=False),
         "",
         "Top 5 Muse rules by lift (high-lift multi-skill rules mostly reflect one employer's template text):",
         rules.head(5)[["antecedents", "consequents", "support", "confidence", "lift"]].to_string(index=False),
         "",
-        f"{line}\nSkill demand (outputs/08_skill_comparison.csv)\n{line}",
+        f"{line}\nCross-source skill shares (08_skill_comparison.csv)\n{line}",
         "Shares of postings. train_tech = Stage 6 'Data, Tech & Engineering' cluster (closest training counterpart).",
         f"Top {TOP_SKILLS} skills in Muse data:",
         comparison.head(TOP_SKILLS)[cols].to_string(index=False),
@@ -713,12 +764,12 @@ def build_summary(fetch_date: str, stats: pd.DataFrame, total: int, n_unique: in
         "Most common technical skills in Muse data:",
         tech[cols].to_string(index=False),
         "",
-        f"Top {TOP_SHIFTS} demand rises vs training tech jobs (skills in >= 5% of either):",
+        f"Top {TOP_SHIFTS} higher shares vs training tech jobs (skills in >= 5% of either):",
         rises[cols].to_string(index=False),
-        f"Top {TOP_SHIFTS} demand drops vs training tech jobs:",
+        f"Top {TOP_SHIFTS} lower shares vs training tech jobs:",
         drops[cols].to_string(index=False),
-        "Caveat: shifts mix real demand change with source differences (The Muse vs LinkedIn, description "
-        "style and length), so treat them as indicative.",
+        "Caveat: differences reflect different populations (The Muse vs LinkedIn, description "
+        "style and length); temporal demand changes cannot be inferred.",
         "",
         f"{line}\nKey finding\n{line}",
         key_finding(validation, (rises, drops), muse,
@@ -730,18 +781,18 @@ def build_summary(fetch_date: str, stats: pd.DataFrame, total: int, n_unique: in
 
 
 def run_pipeline(project_root: Path = None, new_snapshot: bool = False, fetch_date: str = None,
-                 max_per_company: int = MAX_PER_COMPANY) -> dict:
+                 max_per_company: int = MAX_PER_COMPANY, output_dir: Path = None) -> dict:
     """Run Stage 8 end to end on one snapshot.
 
     By default the latest cached snapshot is processed with no API calls; `fetch_date` picks another
-    cached one. new_snapshot=True fetches today's snapshot (only missing pages are requested). The
-    snapshot is upserted into the cleaned CSV and the warehouse; analysis runs on it, with the
+    cached one. API fetching is disabled during bounded validation. The
+    snapshot is upserted into isolated copies of the cleaned CSV and warehouse; analysis runs on it, with the
     company-capped repeat keeping at most `max_per_company` postings per company (0 = no cap).
     """
+    if new_snapshot:
+        raise ValueError("Bounded validation is cache-only; API fetches are disabled")
     root = project_root or find_project_root()
-    paths = muse_paths(root)
-    output_dir = root / "outputs"
-    paths["raw_dir"].mkdir(parents=True, exist_ok=True)
+    paths, output_dir = prepare_run_paths(root, output_dir)
     fetch_date = resolve_fetch_date(paths, fetch_date, new_snapshot)
     logger.info("Snapshot %s (%s)", fetch_date, "new fetch" if new_snapshot else "cache only")
 
@@ -766,12 +817,12 @@ def run_pipeline(project_root: Path = None, new_snapshot: bool = False, fetch_da
     rules.to_csv(output_dir / "08_muse_association_rules.csv", index=False)
     capped_onehot, capped_rules, capped_support, capped_n = mine_muse_rules(capped_muse)
     capped = {"n": capped_n, "support": capped_support, "n_rules": len(capped_rules), "cap": max_per_company}
-    validation = validate_rules(pd.read_csv(output_dir / "04_association_rules.csv"), rules, onehot,
-                                capped_rules, capped_onehot)
+    validation = validate_rules(pd.read_csv(root / "outputs" / "04_association_rules.csv"), rules, onehot,
+                                capped_rules, capped_onehot, min_support=support)
     validation.assign(fetch_date=fetch_date).to_csv(output_dir / "08_rules_validation.csv", index=False)
 
     train = load_cleaned_jobs(root / "data" / "processed" / "cleaned_jobs.csv")
-    labels = pd.read_csv(output_dir / "06_cluster_labels.csv")
+    labels = pd.read_csv(root / "outputs" / "06_cluster_labels.csv")
     tech_ids = set(labels.loc[labels["kmeans_cluster_name"] == "Data, Tech & Engineering", "job_id"])
     comparison = skill_comparison(muse, train, tech_ids, capped_muse)
     comparison.assign(fetch_date=fetch_date).to_csv(output_dir / "08_skill_comparison.csv", index=False)
@@ -795,6 +846,7 @@ def parse_args(argv: list = None) -> argparse.Namespace:
     group.add_argument("--fetch-date", help="process this cached snapshot (YYYY-MM-DD) instead of the latest")
     parser.add_argument("--max-per-company", type=int, default=MAX_PER_COMPANY,
                         help=f"postings kept per company in the capped analysis (default {MAX_PER_COMPANY}; 0 = no cap)")
+    parser.add_argument("--output-dir", type=Path, help="fresh directory outside the input repository")
     parser.add_argument("--list-snapshots", action="store_true", help="list cached snapshots and exit")
     return parser.parse_args(argv)
 
@@ -807,4 +859,4 @@ if __name__ == "__main__":
         logger.info("Cached snapshots: %s", ", ".join(list_snapshots(muse_paths(root))) or "none")
     else:
         run_pipeline(new_snapshot=args.new_snapshot, fetch_date=args.fetch_date,
-                     max_per_company=args.max_per_company)
+                     max_per_company=args.max_per_company, output_dir=args.output_dir)

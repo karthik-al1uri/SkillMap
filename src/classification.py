@@ -8,14 +8,16 @@ Predicts `salary_tier` (Low / Mid / High) from posting features:
     - industry: multi-hot of the top 15 industries plus an Other flag (jobs have up to 3)
     - n_matched_skills: number of matched skills in the posting
 
-Top states and industries are chosen from the training split only.
+Top states, industries and TF-IDF are fitted inside each training CV fold.
+Model families are selected by training CV only. The historical test split has
+already influenced development; its scores remain exploratory, not an untouched test.
 
 Model 4 (XGBoost + title & company TF-IDF) adds TF-IDF weights of the
 TITLE_TFIDF_MAX_FEATURES most frequent job-title words and the COMPANY_TFIDF_MAX_FEATURES
 most frequent company-name words (English stop words and legal suffixes such as "inc"
 removed; both fit on the training split).
 Its hyperparameters are chosen by 3-fold cross-validated grid search on the training
-split only, so the test set is never used for tuning.
+split only. This does not erase the historical test-set selection bias.
 
 Models 5 and 6 are an ordinal experiment with mord: OrdinalRidge (ridge regression on the
 tier codes, rounded) and LogisticIT (immediate-threshold ordinal logistic regression). They
@@ -23,8 +25,10 @@ use the same base + TF-IDF features as Model 4, standardized. A multinomial Logi
 on those features is fit as a control, so the ordinal-vs-nominal comparison holds features fixed.
 
 Run from the project root with:
-    python -m src.classification
+    python -m src.classification --output-dir /path/to/new/run
 """
+import argparse
+import json
 import logging
 import pickle
 import sqlite3
@@ -40,14 +44,16 @@ import numpy as np
 import pandas as pd
 import scipy.sparse as sp
 from matplotlib.colors import LinearSegmentedColormap
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.utils.validation import check_is_fitted
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (accuracy_score, classification_report, confusion_matrix, f1_score,
                              roc_auc_score)
 from sklearn.model_selection import GridSearchCV, StratifiedKFold, train_test_split
-from sklearn.pipeline import make_pipeline
-from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline, make_pipeline
+from sklearn.preprocessing import FunctionTransformer, StandardScaler
 from xgboost import XGBClassifier
 
 from src.preprocessing import find_project_root, load_cleaned_jobs
@@ -196,20 +202,78 @@ def build_text_features(train_df: pd.DataFrame, test_df: pd.DataFrame,
     return A_train, A_test, names, {column: v for column, (_, v) in vectorizers.items()}
 
 
-def tune_title_model(A_train, y_train) -> tuple:
-    """Grid-search XGBoost hyperparameters for Model 4 with 3-fold CV on the training split.
+class PostingFeatures(TransformerMixin, BaseEstimator):
+    """Fit posting categories and optional TF-IDF on the current training fold only."""
 
-    Returns the refit best estimator and a dict with the best params and CV macro F1.
-    """
-    search = GridSearchCV(
+    def __init__(self, skills, use_text=False):
+        self.skills = skills
+        self.use_text = use_text
+
+    def fit(self, X, y=None):
+        """Learn categories, text vocabulary and IDF without consulting validation rows."""
+        self.top_ = choose_top_categories(X)
+        base = build_features(X, self.skills, self.top_)
+        self.feature_names_ = list(base.columns)
+        self.vectorizers_ = {}
+        if self.use_text:
+            _, _, self.feature_names_, self.vectorizers_ = build_text_features(X, X, base, base)
+        return self
+
+    def transform(self, X):
+        """Encode rows using only the metadata learned by fit."""
+        check_is_fitted(self, "top_")
+        base = build_features(X, self.skills, self.top_).to_numpy(dtype=float)
+        parts = [base]
+        for column, vectorizer in self.vectorizers_.items():
+            parts.append(vectorizer.transform(X[column].fillna("")).toarray())
+        return np.column_stack(parts)
+
+    def get_feature_names_out(self, input_features=None):
+        """Return feature names in the exact model input order."""
+        check_is_fitted(self, "feature_names_")
+        return np.asarray(self.feature_names_, dtype=object)
+
+
+def selection_candidates():
+    """Return the existing six families and unchanged title-model search grid."""
+    candidates = {name: (model, False, {}) for name, model in build_models().items()}
+    candidates[TITLE_MODEL_NAME] = (
         XGBClassifier(objective="multi:softprob", eval_metric="mlogloss",
-                      random_state=RANDOM_STATE, n_jobs=-1),
-        TITLE_MODEL_GRID, scoring="f1_macro",
-        cv=StratifiedKFold(n_splits=3, shuffle=True, random_state=RANDOM_STATE))
-    search.fit(A_train, y_train)
-    logger.info("%s grid search: best CV macro F1 %.3f with %s",
-                TITLE_MODEL_NAME, search.best_score_, search.best_params_)
-    return search.best_estimator_, {"best_params": search.best_params_, "cv_f1_macro": search.best_score_}
+                      random_state=RANDOM_STATE, n_jobs=1), True, TITLE_MODEL_GRID)
+    for name, model in build_ordinal_models().items():
+        if name != ORDINAL_CONTROL_NAME:
+            candidates[name] = (model, True, {})
+    return candidates
+
+
+def select_by_training_cv(train_df, y_train, skills, candidates=None, cv=None):
+    """Select/refit using training CV only; no held-out data or scores are accepted.
+
+    candidates maps names to (estimator, use_text, estimator_parameter_grid).
+    The explicit tie-break uses candidate insertion order, never test performance.
+    """
+    candidates = selection_candidates() if candidates is None else candidates
+    cv = cv or StratifiedKFold(n_splits=3, shuffle=True, random_state=RANDOM_STATE)
+    fitted, rows, tuning = {}, [], {}
+    for name, (estimator, use_text, grid) in candidates.items():
+        pipeline = Pipeline([("features", PostingFeatures(skills, use_text)), ("model", estimator)])
+        search = GridSearchCV(pipeline, {f"model__{k}": v for k, v in grid.items()},
+                              scoring="f1_macro", cv=cv, n_jobs=1, error_score="raise")
+        search.fit(train_df, y_train)
+        fitted[name] = search.best_estimator_
+        tuning[name] = {"cv_f1_macro": float(search.best_score_),
+                        "best_params": {k.removeprefix("model__"): v for k, v in search.best_params_.items()}}
+        rows.append({"model": name, **tuning[name]})
+    scores = pd.DataFrame(rows)
+    best = scores.loc[scores["cv_f1_macro"].idxmax(), "model"]
+    return fitted, best, scores, tuning
+
+
+def tune_title_model(train_df, y_train, skills):
+    """Tune Model 4 from raw training rows so preprocessing stays within CV folds."""
+    candidate = {TITLE_MODEL_NAME: selection_candidates()[TITLE_MODEL_NAME]}
+    fitted, _, _, tuning = select_by_training_cv(train_df, y_train, skills, candidates=candidate)
+    return fitted[TITLE_MODEL_NAME], tuning[TITLE_MODEL_NAME]
 
 
 def build_models() -> dict:
@@ -218,10 +282,10 @@ def build_models() -> dict:
         "Logistic Regression": make_pipeline(
             StandardScaler(), LogisticRegression(max_iter=2000, random_state=RANDOM_STATE)),
         "Random Forest": RandomForestClassifier(
-            n_estimators=200, random_state=RANDOM_STATE, n_jobs=-1),
+            n_estimators=200, random_state=RANDOM_STATE, n_jobs=1),
         "XGBoost": XGBClassifier(
             n_estimators=300, learning_rate=0.1, max_depth=6, objective="multi:softprob",
-            eval_metric="mlogloss", random_state=RANDOM_STATE, n_jobs=-1),
+            eval_metric="mlogloss", random_state=RANDOM_STATE, n_jobs=1),
     }
 
 
@@ -263,16 +327,13 @@ def train_and_evaluate(X_train, y_train, X_test, y_test) -> tuple:
     return models, metrics
 
 
-def train_title_model(A_train, y_train, A_test, y_test) -> tuple:
-    """Tune, fit, and evaluate Model 4 on base + title and company TF-IDF features.
-
-    Returns (fitted model, metrics, tuning info).
-    """
-    model, tuning = tune_title_model(A_train, y_train)
-    metrics = evaluate_model(model, A_train, y_train, A_test, y_test)
-    logger.info("%s: F1 macro %.3f, ROC-AUC %.3f", TITLE_MODEL_NAME,
-                metrics["f1_macro"], metrics["roc_auc_ovr"])
-    return model, metrics, tuning
+def train_title_model(train_df, y_train, test_df, y_test, skills):
+    """Tune on raw training rows, then report exploratory held-out performance."""
+    pipeline, tuning = tune_title_model(train_df, y_train, skills)
+    features, model = pipeline["features"], pipeline["model"]
+    metrics = evaluate_model(model, features.transform(train_df), y_train,
+                             features.transform(test_df), y_test)
+    return pipeline, metrics, tuning
 
 
 def build_ordinal_models() -> dict:
@@ -420,7 +481,8 @@ def save_best_model(model, name: str, feature_names: list, top: dict, skills: li
     """
     bundle = {
         "model_name": name,
-        "model": model,
+        "model": Pipeline([("csr", FunctionTransformer(sp.csr_matrix)),
+                           ("dense", FunctionTransformer(sp.csr_matrix.toarray)), ("model", model)]),
         "feature_names": feature_names,
         "top_categories": top,
         "skills": skills,
@@ -443,7 +505,7 @@ def build_summary(df: pd.DataFrame, X: pd.DataFrame, n_train: int, n_test: int, 
     `ordinal_control` (metrics of the multinomial control) adds the ordinal experiment section.
     """
     line = "=" * 80
-    best_row = table.iloc[0]
+    best_row = table.loc[table["model"] == best].iloc[0]
     size_counts = (encode_company_size(df["employee_count"]).value_counts().sort_index()
                    .rename(index=dict(enumerate(COMPANY_SIZE_LABELS))))
     parts = [
@@ -470,10 +532,11 @@ def build_summary(df: pd.DataFrame, X: pd.DataFrame, n_train: int, n_test: int, 
            f"Model 4 hyperparameters (3-fold CV on train, macro F1 {tuning['cv_f1_macro']:.3f}): "
            f"{tuning['best_params']}"] if text_words else []),
         "",
-        f"{line}\nResults (test set)\n{line}",
+        f"{line}\nExploratory results on the previously inspected test split\n{line}",
         table.to_string(index=False),
         "",
-        f"Best model (highest macro F1): {best}",
+        f"Selected model (training CV macro F1 only): {best}",
+        "The historical test split influenced earlier development; these scores are not an untouched evaluation.",
         f"F1 macro {best_row['f1_macro']:.3f} vs target > {F1_TARGET}: "
         f"{'MET' if best_row['meets_f1_target'] else 'NOT MET'}",
         f"ROC-AUC (OvR macro) {best_row['roc_auc_ovr']:.3f} vs target > {AUC_TARGET}: "
@@ -540,54 +603,90 @@ def format_ordinal_experiment(metrics: dict, control: dict) -> str:
     ])
 
 
-def run_pipeline(project_root: Path = None) -> dict:
-    """Run Stage 5 end to end and write the model, results, plots, and summary to outputs/."""
-    root = project_root or find_project_root()
-    output_dir = root / "outputs"
-    output_dir.mkdir(parents=True, exist_ok=True)
+def evaluate_selected_candidates(fitted, train_df, y_train, test_df, y_test):
+    """Evaluate already-selected/refitted candidates without changing their CV winner."""
+    return {name: evaluate_model(pipeline["model"], pipeline["features"].transform(train_df), y_train,
+                                  pipeline["features"].transform(test_df), y_test)
+            for name, pipeline in fitted.items()}
 
+
+def write_evaluation_manifest(output_dir, train_df, test_df, best):
+    """Write identical split and selection provenance for module and notebook runs."""
+    manifest = {"evaluation_status": "exploratory_previously_inspected_test_split",
+                "selection": "training_stratified_3_fold_cv_macro_f1",
+                "preprocessing": "fit_within_each_cv_fold", "selected_model": best,
+                "random_state": RANDOM_STATE, "test_size": TEST_SIZE,
+                "train_job_ids": train_df["job_id"].tolist(), "test_job_ids": test_df["job_id"].tolist(),
+                "limitation": "Not nested CV or an independent external test; historical development used this dataset."}
+    (output_dir / "05_evaluation_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+
+def fit_ordinal_control(train_df, y_train, skills):
+    """Fit the same-feature nominal control without adding a selection candidate."""
+    control = Pipeline([("features", PostingFeatures(skills, True)),
+                        ("model", build_ordinal_models()[ORDINAL_CONTROL_NAME])])
+    return control.fit(train_df, y_train)
+
+
+def prepare_output_dir(root, output_dir):
+    """Require a fresh, noncanonical directory before any training or output writes."""
+    if output_dir is None:
+        raise ValueError("An explicit new output_dir is required; canonical outputs are preserved.")
+    path = Path(output_dir).resolve()
+    for protected in (Path(root).resolve() / "outputs", Path(root).resolve() / "data"):
+        if path == protected or path.is_relative_to(protected):
+            raise ValueError("Output directory must be outside canonical data/ and outputs/.")
+    if path.exists():
+        raise FileExistsError(f"Use a new run directory, not an existing path: {path}")
+    path.mkdir(parents=True)
+    return path
+
+
+def run_pipeline(project_root: Path = None, output_dir: Path = None) -> dict:
+    """Run CV selection and exploratory evaluation into an explicit fresh run directory.
+
+    This retains the historical split for comparability, not independent confirmation.
+    The full search remains expensive and must be explicitly requested by the operator.
+    """
+    root = project_root or find_project_root()
+    output_dir = prepare_output_dir(root, output_dir)
     df = load_model_data(root)
     skills = load_skill_vocabulary(root)
     y = df["salary_tier"].map(TIER_TO_CODE)
     train_df, test_df, y_train, y_test = train_test_split(
         df, y, test_size=TEST_SIZE, stratify=y, random_state=RANDOM_STATE)
-    top = choose_top_categories(train_df)
-    X_train = build_features(train_df, skills, top)
-    X_test = build_features(test_df, skills, top)
-    logger.info("Features: %d columns; train %d, test %d", X_train.shape[1], len(X_train), len(X_test))
-
-    models, metrics = train_and_evaluate(X_train, y_train, X_test, y_test)
-    A_train, A_test, text_names, vectorizers = build_text_features(train_df, test_df, X_train, X_test)
-    models[TITLE_MODEL_NAME], metrics[TITLE_MODEL_NAME], tuning = train_title_model(
-        A_train, y_train, A_test, y_test)
-    ordinal_models, ordinal_metrics, control = train_ordinal_models(A_train, y_train, A_test, y_test)
-    models.update(ordinal_models)
-    metrics.update(ordinal_metrics)
-
-    table = results_table(metrics)
+    fitted, best, cv_scores, tuning = select_by_training_cv(train_df, y_train, skills)
+    metrics = evaluate_selected_candidates(fitted, train_df, y_train, test_df, y_test)
+    control = fit_ordinal_control(train_df, y_train, skills)
+    control_metrics = evaluate_selected_candidates({ORDINAL_CONTROL_NAME: control}, train_df, y_train,
+                                                   test_df, y_test)[ORDINAL_CONTROL_NAME]
+    table = results_table(metrics).merge(cv_scores[["model", "cv_f1_macro"]], on="model")
+    table["selected_by_training_cv"] = table["model"] == best
+    table["evaluation_status"] = "exploratory_previously_inspected_test_split"
     table.to_csv(output_dir / "05_classification_results.csv", index=False)
-    best = table.iloc[0]["model"]
-    uses_text = best in TEXT_FEATURE_MODELS
-    feature_names = text_names if uses_text else list(X_train.columns)
-
-    importances = feature_importance(models[best], feature_names)
+    cv_scores.to_csv(output_dir / "05_cv_selection.csv", index=False)
+    selected = fitted[best]
+    features, model = selected["features"], selected["model"]
+    names = features.feature_names_
+    importances = feature_importance(model, names)
     plot_feature_importance(importances, best, output_dir / "05_feature_importance.png")
     plot_confusion_matrices(metrics, output_dir / "05_confusion_matrix.png")
-    save_best_model(models[best], best, feature_names, top, skills, output_dir / "05_best_model.pkl",
-                    text_vectorizers=vectorizers if uses_text else None)
-
-    text_words = {column: list(v.get_feature_names_out()) for column, v in vectorizers.items()}
-    summary = build_summary(df, X_train, len(X_train), len(X_test), top, table, metrics, best, importances,
-                            text_words=text_words, tuning=tuning, ordinal_control=control)
+    save_best_model(model, best, names, features.top_, skills, output_dir / "05_best_model.pkl",
+                    text_vectorizers=features.vectorizers_ or None)
+    base = build_features(train_df, skills, features.top_)
+    summary = build_summary(df, base, len(train_df), len(test_df), features.top_, table,
+                            metrics, best, importances, ordinal_control=control_metrics)
+    summary += "\nTraining CV selection (fold-contained preprocessing):\n" + cv_scores.to_string(index=False)
     (output_dir / "05_summary.txt").write_text(summary, encoding="utf-8")
-    logger.info("Saved %s", output_dir / "05_summary.txt")
-    return {"models": models, "metrics": metrics, "table": table, "best": best,
-            "importances": importances, "X_train": X_train, "X_test": X_test,
-            "y_train": y_train, "y_test": y_test, "top": top, "summary": summary,
-            "A_train": A_train, "A_test": A_test, "text_vectorizers": vectorizers, "tuning": tuning,
-            "ordinal_control": control}
+    write_evaluation_manifest(output_dir, train_df, test_df, best)
+    return {"fitted": fitted, "metrics": metrics, "table": table, "best": best,
+            "cv_scores": cv_scores, "tuning": tuning, "summary": summary, "output_dir": output_dir,
+            "ordinal_control": control_metrics}
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Stage 5 CV selection; preserves canonical outputs")
+    parser.add_argument("--output-dir", type=Path, required=True, help="new directory outside data/ and outputs/")
+    args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    run_pipeline()
+    run_pipeline(output_dir=args.output_dir)

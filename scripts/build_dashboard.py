@@ -1,20 +1,16 @@
-"""SkillMap dashboard: one self-contained interactive Plotly HTML page.
+"""SkillMap's self-contained six-view analytics product.
 
-Reads data/processed/skillmap.db and the stage outputs in outputs/ and writes
-outputs/dashboard.html with four tabs: association rules, clusters, model results, and live
-trends. Every number comes from those files; nothing is fetched from the network.
-
-Run from the project root with:
-    .venv/bin/python scripts/build_dashboard.py
-    .venv/bin/python scripts/build_dashboard.py --max-per-company 50 --out outputs/dashboard.html
+Render the existing provenance-aware facts bundle into a fresh external HTML file:
+    python scripts/build_dashboard.py --facts /path/facts.json --out /tmp/new-skillmap.html
+No database, model evaluation, training, external assets or network are required.
 """
 import argparse
 import html
 import io
 import json
 import logging
+import hashlib
 import re
-import sqlite3
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -28,13 +24,12 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from src import muse_pipeline as mp  # noqa: E402
-from src.classification import AUC_TARGET, F1_TARGET  # noqa: E402
-from src.clustering import SILHOUETTE_TARGET  # noqa: E402
+from scripts.build_rule_views import rank_general, rank_high, strict_technical  # noqa: E402
 
 logger = logging.getLogger("build_dashboard")
 
-TOP_RULES = 20
-TOP_HIGH_RULES = 15
+TOP_RULES = 10
+TOP_HIGH_RULES = 5
 TOP_CLUSTER_SKILLS = 4
 MIN_CLUSTER_SKILL_SHARE = 0.10
 TOP_LIVE_SKILLS = 15
@@ -105,34 +100,33 @@ def short(text: str, width: int = 48) -> str:
 
 # ---------- data ----------
 
-def load_inputs(root: Path, cap: int) -> dict:
-    """Read every file the dashboard uses; missing optional files come back as None."""
-    out_dir, db = root / "outputs", root / "data" / "processed" / "skillmap.db"
-
-    def csv(name: str):
-        """Read outputs/<name> if it exists."""
-        path = out_dir / name
-        if not path.exists():
-            logger.warning("Missing %s; its charts are skipped", path)
-            return None
-        return pd.read_csv(path)
-
-    data = {name: csv(f"{name}.csv") for name in [
-        "04_association_rules", "04_high_salary_rules", "05_classification_results", "06_cluster_labels",
-        "08_skill_comparison", "08_rules_validation"]}
-    summary = out_dir / "06_summary.txt"
-    data["kmeans_sweep"] = parse_kmeans_sweep(summary.read_text()) if summary.exists() else None
-    with sqlite3.connect(db) as conn:
-        data["jobs"] = pd.read_sql_query("SELECT job_id, salary_tier FROM v_jobs", conn)
-        data["job_skills"] = pd.read_sql_query(
-            "SELECT DISTINCT f.job_id, s.skill_name FROM job_postings f "
-            "JOIN dim_skills s ON s.skill_id = f.skill_id WHERE s.skill_type = 'extracted'", conn)
-        data["n_skills_vocab"] = conn.execute(
-            "SELECT COUNT(*) FROM dim_skills WHERE skill_type = 'extracted'").fetchone()[0]
-    snapshots = mp.warehouse_snapshots(db)
-    data["snapshots"] = {d: mp.load_snapshot(db, d, cap) for d in snapshots}
-    data["snapshot_sizes"] = {d: len(mp.load_snapshot(db, d)) for d in snapshots}
-    data["cap"] = cap
+def load_inputs(facts_path: Path) -> dict:
+    """Render only a generated facts bundle; never read canonical data or a database."""
+    path = Path(facts_path).resolve(strict=True)
+    facts = json.loads(path.read_text())
+    if facts.get("schema") != "skillmap.dashboard.v1":
+        raise ValueError("Expected a skillmap.dashboard.v1 facts bundle")
+    sources = facts.get("sources", {})
+    for section in ("tables", "metrics", "evaluations"):
+        for key, wrapper in facts.get(section, {}).items():
+            if any(source not in sources for source in wrapper.get("source_ids", [])):
+                raise ValueError(f"Unknown provenance source for {section}.{key}")
+    data = {"_facts": facts, "_facts_path": str(path),
+            "_facts_sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+    scalars = {"snapshots", "snapshot_sizes", "cap", "n_skills_vocab"}
+    for key, wrapper in facts.get("tables", {}).items():
+        value = wrapper.get("data") if wrapper.get("available") else None
+        data[key] = value if key in scalars else (pd.DataFrame(value) if value is not None else None)
+    data["snapshots"] = {date: pd.DataFrame(rows) for date, rows in (data.get("snapshots") or {}).items()}
+    data["snapshot_sizes"] = data.get("snapshot_sizes") or {}
+    data["metrics"] = {key: value.get("data") if value.get("available") else None
+                       for key, value in facts.get("metrics", {}).items()}
+    data["evaluations"] = {key: value.get("data") if value.get("available") else None
+                           for key, value in facts.get("evaluations", {}).items()}
+    jobs = data.get("jobs")
+    if jobs is not None and ("job_id" not in jobs or jobs.job_id.duplicated().any()):
+        raise ValueError("Dashboard salary data must contain one row per job_id")
+    grouped_report(data)  # Fail closed on inconsistent selection metadata.
     return data
 
 
@@ -154,7 +148,7 @@ def skill_shares(lists: pd.Series) -> pd.Series:
 
 def rules_by_lift(rules: pd.DataFrame) -> go.Figure:
     """Top rules by lift, one bar per rule."""
-    top = rules.sort_values("lift", ascending=False).head(TOP_RULES).iloc[::-1]
+    top = rank_general(rules, TOP_RULES).iloc[::-1]
     labels = [f"{a} → {c}" for a, c in zip(top["antecedents"], top["consequents"])]
     fig = go.Figure(go.Bar(
         x=top["lift"], y=labels, orientation="h", marker=dict(color=C["series"][0], cornerradius=4),
@@ -166,7 +160,7 @@ def rules_by_lift(rules: pd.DataFrame) -> go.Figure:
 
 def rules_by_high_share(high: pd.DataFrame, jobs: pd.DataFrame) -> go.Figure:
     """High-tier rules ranked by the share of jobs with the itemset that are High tier, vs the overall share."""
-    top = high.sort_values("high_tier_rate", ascending=False).head(TOP_HIGH_RULES).iloc[::-1]
+    top = rank_high(high, TOP_HIGH_RULES).iloc[::-1]
     labels = [short(f"{a} → {c}") for a, c in zip(top["antecedents"], top["consequents"])]
     fig = go.Figure(go.Bar(
         x=top["high_tier_rate"], y=labels, orientation="h", marker=dict(color=C["series"][0], cornerradius=4),
@@ -238,20 +232,21 @@ def cluster_skills(df: pd.DataFrame, job_skills: pd.DataFrame) -> go.Figure:
                        yaxis=dict(showgrid=False, autorange="reversed"))
 
 
-def silhouette_sweep(sweep: pd.DataFrame) -> go.Figure:
+def silhouette_sweep(sweep: pd.DataFrame, target=None) -> go.Figure:
     """K-Means silhouette by k, against the target."""
     fig = go.Figure(go.Scatter(
         x=sweep["k"], y=sweep["silhouette"], mode="lines+markers", line=dict(color=C["series"][0], width=2),
         marker=dict(size=8, line=dict(color=C["surface"], width=2)),
         hovertemplate="k = %{x}<br>silhouette %{y:.3f}<extra></extra>"))
     base_layout(fig, height=300, showlegend=False, xaxis=dict(title="k", dtick=1), yaxis=dict(title="silhouette"))
-    target_line(fig, SILHOUETTE_TARGET, f"target {SILHOUETTE_TARGET:g}", axis="y")
+    if target is not None:
+        target_line(fig, target, f"target {target:g}", axis="y")
     return fig
 
 
 # ---------- tab 3: model results ----------
 
-def model_scores(results: pd.DataFrame) -> go.Figure:
+def model_scores(results: pd.DataFrame, targets=None) -> go.Figure:
     """Macro F1 and ROC-AUC per model, with the project targets."""
     df = results.sort_values("f1_macro")
     fig = go.Figure([go.Bar(y=df["model"], x=df[col], name=name, orientation="h",
@@ -259,8 +254,11 @@ def model_scores(results: pd.DataFrame) -> go.Figure:
                             hovertemplate="%{y}<br>" + name + " %{x:.3f}<extra></extra>")
                      for i, (col, name) in enumerate([("f1_macro", "F1 macro"), ("roc_auc_ovr", "ROC-AUC")])])
     base_layout(fig, height=max(320, 64 * len(df)), barmode="group", xaxis=dict(range=[0, 1]), bargroupgap=0.1)
-    target_line(fig, F1_TARGET, f"F1 target {F1_TARGET:g}", side="left")
-    target_line(fig, AUC_TARGET, f"AUC target {AUC_TARGET:g}")
+    targets = targets or {}
+    if targets.get("f1_macro") is not None:
+        target_line(fig, targets["f1_macro"], f"F1 target {targets['f1_macro']:g}", side="left")
+    if targets.get("roc_auc_ovr") is not None:
+        target_line(fig, targets["roc_auc_ovr"], f"AUC target {targets['roc_auc_ovr']:g}")
     fig.update_layout(legend=dict(y=-0.08, yanchor="top"))
     return fig
 
@@ -317,7 +315,7 @@ def live_shifts(comparison: pd.DataFrame) -> go.Figure:
         hovertemplate="%{y}<br>%{x:+.1f} pp<br>Muse %{customdata[0]:.0%} · training tech %{customdata[1]:.0%}"
                       "<extra></extra>"))
     return base_layout(fig, height=max(380, 24 * len(df)), showlegend=False,
-                       xaxis=dict(title="change (pp)", zeroline=True, zerolinewidth=1))
+                       xaxis=dict(title="cross-source difference (pp)", zeroline=True, zerolinewidth=1))
 
 
 def live_rule_lift(validation: pd.DataFrame) -> go.Figure:
@@ -367,70 +365,275 @@ def note(title: str, text: str) -> str:
     return f'<section class="card"><h3>{html.escape(title)}</h3><p class="note">{html.escape(text)}</p></section>'
 
 
+def selected_model_row(results):
+    """Use an explicit unique training-CV selection; never infer it from test scores."""
+    if "selected_by_training_cv" not in results:
+        return None
+    flags = results["selected_by_training_cv"].astype(str).str.lower().eq("true")
+    selected = results.loc[flags]
+    return selected.iloc[0] if len(selected) == 1 else None
+
+
+def grouped_report(data):
+    """Use the unique winner selected by mean training CV; reject conflicting metadata."""
+    grouped = (data.get("evaluations") or {}).get("grouped")
+    if not grouped:
+        return None
+    report = grouped.get("report", {})
+    if report.get("status") != "complete":
+        return None
+    rows = report.get("cv_rows", [])
+    if not rows or report.get("winner") != max(rows, key=lambda row: row["mean_f1_macro"])["candidate"]:
+        raise ValueError("Grouped model winner disagrees with training CV")
+    selection = grouped.get("cv_selection") or {}
+    if selection.get("winner", report["winner"]) != report["winner"]:
+        raise ValueError("Conflicting grouped selection metadata")
+    return report
+
+
+def provenance_note(data, *keys, evaluations=()):
+    facts = data.get("_facts", {})
+    entries = [facts.get("tables", {}).get(key) for key in keys]
+    entries += [facts.get("evaluations", {}).get(key) for key in evaluations]
+    entries = [entry for entry in entries if entry]
+    scopes = sorted({entry["status"].replace("_", " ") for entry in entries})
+    ids = sorted({source for entry in entries for source in entry.get("source_ids", [])})
+    return note("Evidence", (" / ".join(scopes) or "Unavailable evidence") +
+                (". Sources: " + ", ".join(ids) if ids else ". No source supplied."))
+
+
+def horizontal_values(labels, values, title, percent=False):
+    fig = go.Figure(go.Bar(y=list(labels), x=list(values), orientation="h",
+                          marker=dict(color=C["series"][0], cornerradius=4)))
+    return base_layout(fig, height=max(300, 25*len(labels)), showlegend=False,
+                       xaxis=dict(title=title, tickformat=".0%" if percent else None),
+                       yaxis=dict(autorange="reversed"))
+
+
+def confusion_figure(matrix, labels=TIERS):
+    fig = go.Figure(go.Heatmap(z=matrix, x=labels, y=labels, text=matrix, texttemplate="%{text}",
+                              colorscale="Blues", showscale=False))
+    return base_layout(fig, height=320, xaxis=dict(title="predicted", showgrid=False),
+                       yaxis=dict(title="observed", autorange="reversed", showgrid=False))
+
+
+def salary_summary(jobs):
+    """Every salary observation is a job, regardless of its number of skills."""
+    if jobs.job_id.duplicated().any():
+        raise ValueError("Salary views require unique job_id grain")
+    salaries = pd.to_numeric(jobs.normalized_salary, errors="raise")
+    if salaries.isna().any():
+        raise ValueError("Salary observations must be complete")
+    return {"count": len(jobs), "median": float(salaries.median())}
+
+
+def compact_provenance(data):
+    facts = data["_facts"]
+    return {"schema": facts["schema"], "generated_utc": facts.get("generated_utc"),
+            "sources": facts.get("sources", {}), "metrics": facts.get("metrics", {}),
+            "evaluations": facts.get("evaluations", {}),
+            "provenance": {**facts.get("provenance", {}), "salary_grain": "unique_job_id"},
+            "table_provenance": {key: {k: v for k, v in wrapper.items() if k != "data"}
+                                 for key, wrapper in facts.get("tables", {}).items()},
+            "bundle_sha256": data["_facts_sha256"]}
+
+
+def cached_summary(result):
+    intervals = result.get("bootstrap", {})
+    def ci(key):
+        row = intervals.get(key) or {}
+        return f"{row['low']:.4f}–{row['high']:.4f}" if row.get("low") is not None else "unavailable"
+    comparators = result.get("comparators", {})
+    training, oracle = comparators.get("historical_training_majority"), comparators.get("observed_majority_oracle")
+    text = f"95% employer-cluster intervals: accuracy {ci('accuracy')}; macro F1 {ci('macro_f1')}. "
+    if training:
+        text += f"Training-majority ({training['label']}): accuracy {training['accuracy']:.4f}, macro F1 {training['macro_f1']:.4f}. "
+    if oracle:
+        text += f"Observed-majority oracle ({oracle['label']}, uses evaluation labels): accuracy {oracle['accuracy']:.4f}, macro F1 {oracle['macro_f1']:.4f}. "
+    labels = result.get("salary_label_status", {})
+    if labels:
+        text += f"Targets: {labels['estimated_rows']:,} estimated salaries; {labels['advertised_rows']:,} advertised. "
+    text += "Intervals condition on cached predictions and employers. ROC-AUC is unavailable without saved probabilities."
+    return text
+
+
+def grouped_intervals(report):
+    labels = {"f1_macro": "macro F1", "accuracy": "accuracy", "roc_auc_ovr_macro": "ROC-AUC"}
+    rows = report.get("bootstrap", {}).get("intervals", {})
+    return "; ".join(f"{label} {rows[key]['lower_2.5']:.4f}–{rows[key]['upper_97.5']:.4f}"
+                     for key, label in labels.items() if rows.get(key)) + ". These omit fitting and selection uncertainty."
+
+
 def build_tabs(data: dict) -> list:
-    """Return [(tab id, tab label, tiles html, cards html)]."""
+    """Six analyst views over one generated provenance-aware facts bundle."""
     tabs = []
+    metrics, evaluations = data.get("metrics", {}), data.get("evaluations", {})
+    jobs, job_skills = data.get("jobs"), data.get("job_skills")
+    grouped = grouped_report(data)
+    live = (evaluations.get("live") or {}).get("report")
+    dates = metrics.get("live_snapshot_dates") or sorted(data.get("snapshot_sizes", {}))
+    targets = dict(metrics.get("model_targets") or {})
+    if "roc_auc" in targets:
+        targets["roc_auc_ovr"] = targets["roc_auc"]
 
-    cards, tiles = [], []
-    if data["04_association_rules"] is not None:
-        rules = data["04_association_rules"]
-        tiles += [tile("top rules", f"{len(rules)}"), tile("max lift", f"{rules['lift'].max():.2f}")]
-        cards.append(card("Top rules by lift", rules_by_lift(rules), "rules-lift"))
-    if data["04_high_salary_rules"] is not None:
-        high = data["04_high_salary_rules"]
-        tiles.append(tile("High-tier rules", f"{len(high)}"))
-        cards.append(card("High-tier rules by share High", rules_by_high_share(high, data["jobs"]), "rules-high"))
-    tabs.append(("rules", "Association rules", tiles, cards))
+    tiles, cards = [], []
+    for key, label, fmt in [("n_jobs", "saved training jobs", lambda v: f"{v:,}"),
+                             ("n_skills_vocab", "frozen skill vocabulary", str),
+                             ("mean_skills", "mean skills per job", lambda v: f"{v:.2f}"),
+                             ("median_salary", "median annual salary", lambda v: f"${v:,.0f}")]:
+        if metrics.get(key) is not None:
+            tiles.append(tile(label, fmt(metrics[key])))
+    if grouped:
+        tiles.append(tile("grouped holdout macro F1", f"{grouped['outer_metrics']['f1_macro']:.4f}"))
+    cards += [note("Read the evidence by scope", "Artifact-derived counts describe saved jobs. Historical exploratory results "
+                   "used an inspected test split. The new grouped evaluation reuses development data. Live results are cached snapshots, not current-market measurements."),
+              note("Analyst guide", "Skills: prevalence and association. Salary: job-level distributions and descriptive associations. "
+                   "Clusters: saved groupings and bounded robustness. Live: dated cross-source checks. Model: training-CV selection and grouped holdout uncertainty."),
+              note("Cached snapshot dates", ", ".join(dates) if dates else "No cached snapshot dates supplied.")]
+    facts = data.get("_facts", {})
+    if facts.get("sources"):
+        rows = "".join("<tr><td>"+html.escape(source_id)+"</td><td>"+html.escape(source.get("status", ""))+
+                       "</td><td>"+html.escape(source.get("path", ""))+"</td><td><code>"+
+                       html.escape(source.get("sha256", "unavailable"))+"</code></td></tr>"
+                       for source_id, source in facts["sources"].items())
+        cards.append('<section class="card wide"><h3>Source provenance</h3><div class="table-scroll"><table>'
+                     '<thead><tr><th>Source</th><th>Scope</th><th>Artifact</th><th>SHA-256</th></tr></thead><tbody>'+rows+'</tbody></table></div></section>')
+    tabs.append(("overview", "Overview", tiles, cards))
 
-    cards, tiles = [], []
-    if data["06_cluster_labels"] is not None:
-        df = cluster_frame(data["06_cluster_labels"])
-        tiles += [tile("clusters", f"{df['cluster'].nunique()}"), tile("jobs clustered", f"{len(df):,}")]
-        cards += [card("Salary tier mix", cluster_tier_mix(df), "cl-tiers"),
-                  card("Salary by cluster", cluster_salary(df), "cl-salary"),
-                  card("Distinctive skills", cluster_skills(df, data["job_skills"]), "cl-skills")]
-    if data["kmeans_sweep"] is not None:
-        sweep = data["kmeans_sweep"]
-        tiles.append(tile("best silhouette", f"{sweep['silhouette'].max():.3f}"))
-        cards.append(card("K-Means silhouette by k", silhouette_sweep(sweep), "cl-sil"))
+    tiles, cards = [], []
+    counts = metrics.get("skill_counts")
+    if counts:
+        if isinstance(counts, list):
+            counts = {row.get("skill", row.get("skill_name")): row.get("count", row.get("jobs")) for row in counts}
+        top = sorted(counts.items(), key=lambda item: (-item[1], item[0]))[:20]
+        cards.append(card("Most prevalent extracted skills · all jobs", horizontal_values(
+            [key for key, _ in top], [value / metrics["n_jobs"] for _, value in top], "share of all jobs", True), "skills-prevalence"))
+    rules = data.get("04_association_rules")
+    if rules is not None and len(rules):
+        cards.append(card("Top 10 rules by lift", rules_by_lift(rules), "rules-lift"))
+        tiles.append(tile("general candidates supplied", str(len(rules))))
+    technical = data.get("04_technical_rules_low_support")
+    if technical is not None:
+        technical = strict_technical(technical) if len(technical) else technical
+        tiles.append(tile("technical-only rules", str(len(technical))))
+        cards.append(card("Technical-only rules", rules_by_lift(technical), "rules-tech") if len(technical)
+                     else note("Technical-only rules", "No supplied rule contains exclusively forced-technical skills on both sides."))
+    cards += [note("Rule definitions", "General support ≥5% includes empty baskets; technical support ≥2% uses all jobs. "
+                   "Confidence >0.5 and lift >1.5 are applied before rounding. Technical-only requires every skill on both sides in the frozen technical set. Views rank supplied candidates."),
+              provenance_note(data, "jobs", "job_skills", "04_association_rules", "04_technical_rules_low_support")]
+    tabs.append(("skills", "Skills", tiles, cards))
+
+    tiles, cards = [], []
+    if jobs is not None and len(jobs):
+        summary = salary_summary(jobs)
+        tiles += [tile("jobs in salary views", f"{summary['count']:,}"),
+                  tile("median annual salary", f"${summary['median']:,.0f}")]
+        cards.append(card("Annual salary distribution · one observation per job", base_layout(go.Figure(
+            go.Histogram(x=jobs.normalized_salary, nbinsx=40, marker=dict(color=C["series"][0]))),
+            xaxis=dict(title="annual USD"), yaxis=dict(title="jobs")), "salary-distribution"))
+        tiers = jobs.salary_tier.value_counts().reindex(TIERS, fill_value=0)
+        cards.append(card("Salary-tier counts", horizontal_values(tiers.index, tiers, "jobs"), "salary-tiers"))
+        if "experience_level" in jobs:
+            by_experience = jobs.groupby("experience_level").normalized_salary.agg(["median", "size"]).sort_values("median")
+            fig = go.Figure(go.Bar(y=by_experience.index, x=by_experience["median"], orientation="h", customdata=by_experience["size"],
+                hovertemplate="%{y}<br>median $%{x:,.0f}<br>%{customdata:,} jobs<extra></extra>"))
+            cards.append(card("Median salary by recorded experience", base_layout(fig, xaxis=dict(title="annual USD")), "salary-experience"))
+    high = data.get("04_high_salary_rules")
+    if high is not None and len(high) and jobs is not None:
+        cards.append(card("Top 5 High-tier rules by share High", rules_by_high_share(high, jobs), "rules-high"))
+    bounds = metrics.get("salary_tier_boundaries")
+    if bounds:
+        cards.append(note("Fixed salary task", f"Low ≤ ${bounds['low_max']:,.0f}; Mid above that and ≤ ${bounds['mid_max']:,.0f}; High above ${bounds['mid_max']:,.0f}. Boundaries are frozen historical task definitions."))
+    cards += [note("Grain and interpretation", "Salary observations are unique jobs, never expanded through job-skill fact rows. "
+                   "Salary associations are descriptive, not causal. Historical tier boundaries were derived from global dataset quantiles before the model split."),
+              provenance_note(data, "jobs", "04_high_salary_rules", evaluations=("salary_quality",))]
+    tabs.append(("salary", "Salary", tiles, cards))
+
+    tiles, cards = [], []
+    labels = data.get("06_cluster_labels")
+    if labels is not None and len(labels):
+        df = cluster_frame(labels)
+        if df.job_id.duplicated().any():
+            raise ValueError("Cluster salary views require unique jobs")
+        tiles += [tile("historical clusters", str(df.cluster.nunique())), tile("jobs clustered", f"{len(df):,}")]
+        cards += [card("Historical salary tier mix", cluster_tier_mix(df), "cl-tiers"),
+                  card("Historical salary by cluster", cluster_salary(df), "cl-salary")]
+        if job_skills is not None:
+            cards.append(card("Historical distinctive skills", cluster_skills(df, job_skills), "cl-skills"))
+    sweep = data.get("kmeans_sweep")
+    if sweep is not None and len(sweep):
+        cards.append(card("Historical K-Means silhouette by k", silhouette_sweep(sweep, targets.get("silhouette")), "cl-sil"))
+    robustness = (evaluations.get("clustering") or {}).get("report")
+    if robustness and robustness.get("summary"):
+        fig = go.Figure()
+        for i, name in enumerate(dict.fromkeys(row["representation"] for row in robustness["summary"])):
+            rows = [row for row in robustness["summary"] if row["representation"] == name]
+            fig.add_trace(go.Scatter(x=[row["k"] for row in rows], y=[row["mean_cosine_silhouette_original"] for row in rows],
+                                    name=name, mode="lines+markers", line=dict(color=C["series"][i])))
+        cards.append(card("Bounded robustness · common original-space cosine", base_layout(fig, xaxis=dict(title="k"), yaxis=dict(title="mean cosine silhouette")), "cl-robustness"))
+    cards += [note("Clustering scope", "Saved clusters and bounded robustness are exploratory. Weak separation is not proof that meaningful clusters cannot exist. "
+                   "Seed stability is not resampling or external validation; SVD/L2 features were not adopted for classification."),
+              provenance_note(data, "06_cluster_labels", "kmeans_sweep", evaluations=("clustering",))]
     tabs.append(("clusters", "Clusters", tiles, cards))
 
-    cards, tiles = [], []
-    if data["05_classification_results"] is not None:
-        res = data["05_classification_results"]
-        best = res.loc[res["f1_macro"].idxmax()]
-        tiles += [tile("best F1 macro", f"{best['f1_macro']:.3f}"), tile("best ROC-AUC", f"{res['roc_auc_ovr'].max():.3f}"),
-                  tile("best model", best["model"])]
-        cards += [card("F1 and ROC-AUC", model_scores(res), "m-scores", wide=True),
-                  card("F1 by tier", model_tiers(res), "m-tiers")]
-        if "train_f1_macro" in res:
-            cards.append(card("Train vs test F1", model_overfit(res), "m-overfit"))
-    tabs.append(("models", "Model results", tiles, cards))
+    tiles, cards = [], [note("Cached evidence", "Snapshot dates: " + (", ".join(dates) or "unavailable") +
+        ". One snapshot and different source/employer populations do not establish temporal demand trends. Estimated salary labels are imperfect targets.")]
+    if live:
+        a, uncapped, capped = live["adzuna"], live["muse_uncapped"], live["muse_company_capped"]
+        tiles += [tile("cached Adzuna accuracy", f"{a['accuracy']:.4f}"), tile("cached Adzuna macro F1", f"{a['macro_f1']:.4f}"),
+                  tile("Muse rules confirmed", f"{uncapped['primary_confirmed']} / {uncapped['fixed_rules']}"),
+                  tile("Muse rules · company capped", f"{capped['primary_confirmed']} / {capped['fixed_rules']}")]
+        fig = go.Figure([go.Bar(x=TIERS, y=[a[key][tier] for tier in TIERS], name=label)
+                         for key, label in [("actual_counts", "observed salary tier"), ("predicted_counts", "cached predicted tier")]])
+        cards += [card("Adzuna observed vs predicted distribution", base_layout(fig, barmode="group", yaxis=dict(title="postings")), "live-distribution"),
+                  card("Adzuna confusion matrix", confusion_figure(a["confusion_rows_actual_columns_predicted"]), "live-confusion"),
+                  note("Adzuna uncertainty and baselines", cached_summary(a)),
+                  note("Muse populations and uncertainty", f"Uncapped eligible/all: {uncapped['eligible_postings']}/{uncapped['all_postings']}; "
+                       f"capped eligible/all: {capped['eligible_postings']}/{capped['all_postings']}. "
+                       "Rules are fixed historical candidates. Employer resampling, not independent model validation. "+
+                       "Confirmed uncapped: "+", ".join(uncapped.get("confirmed_primary_rules", []))+"; capped: "+", ".join(capped.get("confirmed_primary_rules", [])))]
+        rule_rows = (evaluations.get("live") or {}).get("uncapped_fixed_rules")
+        if isinstance(rule_rows, list) and rule_rows:
+            val = pd.DataFrame(rule_rows).rename(columns={"training_saved_lift_historical": "training_lift", "lift": "muse_lift", "passes_primary_005": "validated"})
+            cards.append(card("Fixed historical rules · cached Muse lift", live_rule_lift(val), "lv-rules"))
+    else:
+        cards.append(note("Live evaluation unavailable", "No generated cached-validation report supplied; historical metrics are not substituted."))
+    comparison = data.get("08_skill_comparison")
+    if comparison is not None and len(comparison):
+        cards += [card("Cached Muse vs training skill shares", live_vs_training(comparison), "lv-share"),
+                  card("Cross-source share differences · historical snapshot", live_shifts(comparison), "lv-shift")]
+    if len(data.get("snapshots", {})) > 1:
+        cards.append(card("Cached skill share by fetch date · company capped", live_by_fetch_date(data["snapshots"]), "lv-by-date"))
+    else:
+        cards.append(note("Time coverage", "A single cached snapshot cannot establish a temporal market trend."))
+    cards.append(provenance_note(data, "08_skill_comparison", evaluations=("live",)))
+    tabs.append(("live", "Live", tiles, cards))
 
-    cards, tiles = [], []
-    snapshots = data["snapshots"]
-    comp, val = data["08_skill_comparison"], data["08_rules_validation"]
-    analysed = next((str(df["fetch_date"].iloc[0]) for df in (comp, val) if df is not None and "fetch_date" in df), None)
-    suffix = f" · {analysed}" if analysed else ""
-    if analysed:
-        tiles.append(tile("fetch analysed", analysed))
-        if analysed in data["snapshot_sizes"]:
-            tiles.append(tile("postings", f"{data['snapshot_sizes'][analysed]:,}"))
-    if snapshots:
-        tiles += [tile("snapshots", f"{len(snapshots)}"),
-                  tile("cap per company", f"{data['cap']}" if data["cap"] else "none")]
-    if comp is not None:
-        cards += [card("Live vs training skill share" + suffix, live_vs_training(comp), "lv-share"),
-                  card("Largest shifts vs training tech" + suffix, live_shifts(comp), "lv-shift")]
-    if val is not None:
-        tiles.append(tile("rules confirmed", f"{int(val['validated'].sum())} of {len(val)}"))
-        cards.append(card("Rule lift: training vs Muse" + suffix, live_rule_lift(val), "lv-rules"))
-    if len(snapshots) > 1:
-        cards.append(card("Skill share by fetch date", live_by_fetch_date(snapshots), "lv-trend"))
-    elif snapshots:
-        cards.append(note("Skill share by fetch date", f"One snapshot ({max(snapshots)}). Trends appear after "
-                          "python -m src.muse_pipeline --new-snapshot."))
-    tabs.append(("live", "Live trends", tiles, cards))
+    tiles, cards = [], []
+    if grouped:
+        m = grouped["outer_metrics"]
+        tiles += [tile("CV-selected model", grouped["winner"]), tile("grouped holdout macro F1", f"{m['f1_macro']:.4f}"),
+                  tile("grouped holdout ROC-AUC", f"{m['roc_auc_ovr_macro']:.4f}")]
+        cv = grouped["cv_rows"]
+        cards += [card("Model selection · training grouped CV only", horizontal_values([row["candidate"] for row in cv],
+                        [row["mean_f1_macro"] for row in cv], "mean inner-CV macro F1"), "model-cv"),
+                  card("Selected model · per-class F1", horizontal_values(TIERS, [m["f1_per_class"][tier] for tier in TIERS], "F1"), "model-classes"),
+                  card("Selected model · grouped holdout confusion", confusion_figure(m["confusion_matrix"]), "model-confusion"),
+                  note("New grouped evaluation · reused development data", "The selected model comes only from training grouped CV. "
+                       "Normalized-description groups are isolated; employers may overlap. This is not an untouched external test. "
+                       "Conditional 95% group-bootstrap intervals: " + grouped_intervals(grouped))]
+    else:
+        cards.append(note("Grouped evaluation unavailable", "No complete grouped evaluation supplied; no model is chosen from historical test F1."))
+    historical = data.get("05_classification_results")
+    if historical is not None and len(historical):
+        cards += [note("Historical exploratory results", "The old test split influenced development and model selection. "
+                       "Historical scores and the new grouped comparison use different splits and search scope; score differences do not isolate grouping effects."),
+                  card("Historical exploratory F1 and ROC-AUC", model_scores(historical, targets), "m-scores", wide=True),
+                  card("Historical exploratory F1 by tier", model_tiers(historical), "m-tiers")]
+        if "train_f1_macro" in historical:
+            cards.append(card("Historical exploratory train vs test F1", model_overfit(historical), "m-overfit"))
+    cards.append(provenance_note(data, "05_classification_results", evaluations=("grouped",)))
+    tabs.append(("model", "Model", tiles, cards))
     return tabs
 
 
@@ -453,6 +656,8 @@ nav button[aria-selected="true"]{color:var(--ink);border-bottom-color:var(--acce
 nav button:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
 main{max-width:1280px;margin:0 auto;padding:16px}
 .panel[hidden]{display:none}
+.table-scroll{overflow:auto}table{border-collapse:collapse;font-size:12px;width:100%}th,td{text-align:left;padding:7px;border-bottom:1px solid var(--grid);vertical-align:top}td code{font-size:10px}p.note{overflow-wrap:anywhere}
+
 .tiles{display:flex;flex-wrap:wrap;gap:12px;margin-bottom:16px}
 .tile{background:var(--surface);border:1px solid var(--ring);border-radius:10px;padding:10px 14px;min-width:120px}
 .tile-v{font-size:20px;font-weight:600;color:var(--ink)}
@@ -485,52 +690,84 @@ function applyTheme() {
   });
 }
 function show(id) {
-  document.querySelectorAll('nav button').forEach(b => b.setAttribute('aria-selected', b.dataset.tab === id));
+  document.querySelectorAll('nav button').forEach(b => (b.setAttribute('aria-selected', b.dataset.tab === id), b.setAttribute('tabindex', b.dataset.tab === id ? '0' : '-1')));
   document.querySelectorAll('.panel').forEach(p => { p.hidden = p.id !== id; });
   document.querySelectorAll('#' + id + ' .js-plotly-plot').forEach(gd => Plotly.Plots.resize(gd));
   try { localStorage.setItem('skillmap-tab', id); } catch (e) {}
   history.replaceState(null, '', '#' + id);
 }
-document.querySelectorAll('nav button').forEach(b => b.addEventListener('click', () => show(b.dataset.tab)));
+document.querySelectorAll('nav button').forEach(b => {
+  b.addEventListener('click', () => show(b.dataset.tab));
+  b.addEventListener('keydown', e => {
+    const buttons = [...document.querySelectorAll('nav button')];
+    let index = buttons.indexOf(b);
+    if (e.key === 'ArrowRight') index = (index + 1) % buttons.length;
+    else if (e.key === 'ArrowLeft') index = (index + buttons.length - 1) % buttons.length;
+    else if (e.key === 'Home') index = 0;
+    else if (e.key === 'End') index = buttons.length - 1;
+    else return;
+    e.preventDefault(); buttons[index].focus(); show(buttons[index].dataset.tab);
+  });
+});
 let saved = null;
 try { saved = localStorage.getItem('skillmap-tab'); } catch (e) {}
 const hash = location.hash.slice(1);
-show([hash, saved].find(id => id && document.getElementById(id)) || document.querySelector('nav button').dataset.tab);
+const aliases = {rules:'skills',models:'model'};
+const validTabs = new Set([...document.querySelectorAll('nav button')].map(b => b.dataset.tab));
+show([hash,saved].map(id => aliases[id] || id).find(id => validTabs.has(id)) || 'overview');
 applyTheme();
 matchMedia('(prefers-color-scheme: dark)').addEventListener('change', applyTheme);
 new MutationObserver(applyTheme).observe(document.documentElement, {attributes: true, attributeFilter: ['data-theme']});
 """
 
 
+def render_product_page(product: dict, provenance: dict) -> str:
+    """Inline the product assets and facts-derived compact data; no CDN or build step."""
+    assets = ROOT / "src" / "dashboard_assets"
+    icons = {
+        "overview": '<rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/>',
+        "skills": '<circle cx="12" cy="12" r="3"/><circle cx="4" cy="5" r="2"/><circle cx="20" cy="5" r="2"/><circle cx="4" cy="20" r="2"/><circle cx="20" cy="20" r="2"/><path d="m6 6 4 4m4 0 4-4M6 18l4-4m4 0 4 4"/>',
+        "salary": '<rect x="3" y="5" width="18" height="14" rx="3"/><circle cx="12" cy="12" r="3"/><path d="M6 12h.01M18 12h.01"/>',
+        "clusters": '<circle cx="8" cy="8" r="4"/><circle cx="17" cy="8" r="3"/><path d="M2 21v-2a6 6 0 0 1 12 0v2m2-7a5 5 0 0 1 6 5v2"/>',
+        "live": '<path d="M2 12h4l3-8 5 16 3-8h5"/>',
+        "model": '<path d="M4 20V4m0 16h17M8 16l4-5 4 2 5-8"/>',
+    }
+    nav = "".join(f'<button id="tab-{key}" role="tab" data-tab="{key}" aria-controls="{key}" '
+                  f'aria-selected="{str(i == 0).lower()}" tabindex="{0 if i == 0 else -1}">'
+                  f'<svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor">{icon}</svg>'
+                  f'{key.title()}</button>' for i, (key, icon) in enumerate(icons.items()))
+    def safe_json(value):
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False).replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
+    page = (assets / "product.html").read_text()
+    values = {"__CSS__": (assets / "product.css").read_text(), "__PLOTLY__": get_plotlyjs(),
+              "__NAV__": nav, "__DATA__": safe_json(product), "__PROVENANCE__": safe_json(provenance),
+              "__JS__": (assets / "product.js").read_text()}
+    # Substitute template tokens in one pass: data cannot inject another template placeholder.
+    return re.sub(r"__(?:CSS|PLOTLY|NAV|DATA|PROVENANCE|JS)__", lambda match: values[match.group()], page)
+
+
 def render_page(data: dict) -> str:
-    """Assemble the full HTML page."""
-    tabs = build_tabs(data)
-    n_jobs = len(data["jobs"])
-    sub = f"{n_jobs:,} training jobs · {data['n_skills_vocab']} skills · {len(data['snapshots'])} live snapshot(s) · " \
-          f"built {datetime.now():%Y-%m-%d %H:%M}"
-    nav = "".join(f'<button role="tab" data-tab="{tid}" aria-controls="{tid}">{html.escape(label)}</button>'
-                  for tid, label, _, _ in tabs)
-    panels = "".join(f'<div class="panel" id="{tid}" role="tabpanel"><div class="tiles">{"".join(tiles)}</div>'
-                     f'<div class="grid">{"".join(cards)}</div></div>' for tid, _, tiles, cards in tabs)
-    return (f'<!doctype html><html lang="en"><head><meta charset="utf-8">'
-            f'<meta name="viewport" content="width=device-width,initial-scale=1"><title>SkillMap Dashboard</title>'
-            f'<style>{PAGE_CSS}</style><script>{get_plotlyjs()}</script></head><body>'
-            f'<header><h1>SkillMap</h1><div class="sub">{html.escape(sub)}</div></header>'
-            f'<nav role="tablist">{nav}</nav><main>{panels}</main>'
-            f'<script>{PAGE_JS.replace("__MAP__", json.dumps(theme_map()))}</script></body></html>')
+    """Build compact, unique-job product data from the supplied facts and render it."""
+    from src.dashboard_data import build_product_data
+    product = build_product_data(data["_facts"])
+    return render_product_page(product, compact_provenance(data))
 
 
 def main(argv: list = None) -> Path:
-    """Build outputs/dashboard.html (or --out) from the warehouse and stage outputs."""
-    parser = argparse.ArgumentParser(description="Build the SkillMap Plotly dashboard")
-    parser.add_argument("--root", type=Path, default=ROOT, help="project root (default: this repository)")
-    parser.add_argument("--out", type=Path, help="output HTML (default: <root>/outputs/dashboard.html)")
-    parser.add_argument("--max-per-company", type=int, default=mp.MAX_PER_COMPANY,
-                        help=f"company cap for the by-fetch-date trend (default {mp.MAX_PER_COMPANY}; 0 = no cap)")
+    """Render generated facts into a fresh isolated HTML artifact."""
+    parser = argparse.ArgumentParser(description="Build SkillMap from generated facts, without canonical reads")
+    parser.add_argument("--facts", type=Path, required=True, help="generated dashboard facts JSON")
+    parser.add_argument("--out", type=Path, required=True, help="fresh output HTML outside the repository")
     args = parser.parse_args(argv)
-    out = args.out or args.root / "outputs" / "dashboard.html"
-    data = load_inputs(args.root, args.max_per_company)
-    out.write_text(render_page(data), encoding="utf-8")
+    out = args.out.resolve()
+    if out == ROOT.resolve() or ROOT.resolve() in out.parents:
+        parser.error("--out must be outside the source repository")
+    if out.exists():
+        parser.error("--out must name a new file; existing artifacts are preserved")
+    data = load_inputs(args.facts)
+    page = render_page(data)
+    with out.open("x", encoding="utf-8") as handle:
+        handle.write(page)
     logger.info("Saved %s (%.1f MB)", out, out.stat().st_size / 1e6)
     return out
 
